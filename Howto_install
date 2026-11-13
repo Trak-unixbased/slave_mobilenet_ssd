@@ -1,0 +1,2890 @@
+Je clone le dépôt et j'analyse son contenu avant de corriger quoi que ce soit.
+
+Now the pipeline (capture → NPU → display).
+
+Now a fake `librknn_api` (test-only, outside the repo) to exercise the whole pipeline on this machine.
+
+Le projet est maintenant corrigé, optimisé et empaqueté. Vous avez ci-dessous chaque fichier modifié en entier, plus le patch et l'archive.
+
+**Point bloquant : ni la Pi 5 ni l'Orange Pi 6 Plus n'ont de NPU Rockchip.** Ce dépôt est le côté hôte d'une **clé de calcul USB RK1808 en mode passif** (d'où le « slave »). L'inférence tourne sur la clé ; la carte ne fait que la capture, le post-traitement et l'affichage. Sans cette clé, le programme ne peut pas fonctionner. Le NPU intégré du CD8180 demande un autre SDK (CIX NOE) et un modèle converti, ce qui serait un autre projet.
+
+## /review + /debug — bugs corrigés
+
+| Fichier | Bug | Effet |
+|---|---|---|
+| `install_rknn_api.sh` | `repo.rock-chips.com` n'existe plus (DNS) | installation impossible |
+| idem | on ne peut pas reprendre la lib de `rknpu` | c'est le chargeur *embarqué* (`dlopen librknn_runtime.so`) ; il ne sait pas piloter une clé. Le vrai client hôte 1.7.5 n'existe que dans le wheel `rknn-toolkit-lite` |
+| `CMakeLists.txt` | `cmake_minimum_required(2.8)` | échec de configuration sous CMake ≥ 4 |
+| idem | `CMAKE_SYSTEM_NAME` et le compilateur fixés après `project()`, lib cherchée dans `/usr/local` alors que le script l'installe dans `/usr` | build fragile ou cassé |
+| `ssd_demo.cpp` | `strtok` sur `line.c_str()` (const_cast) | comportement indéfini |
+| idem | `strrchr(file,'/')+1` quand le chemin n'a pas de `/` | pointeur invalide |
+| idem | erreurs de `loadCoderOptions` et `loadLabelName` ignorées, aucune borne sur les tableaux | priors non initialisés ou débordement |
+| idem | sorties supposées dans l'ordre `out[1]`/`out[0]`, taille jamais vérifiée | lecture hors buffer si le modèle diffère |
+| idem | NMS sans tri par score ; au-delà de 100 candidats, rien n'est dessiné | détections perdues |
+| idem | `VIDEO_NODE = 0` | sur Pi 5, `/dev/video0` est le RP1-CFE (Bayer brut), pas une webcam |
+| `rknn.cpp` | `rknn_ctx < 0` sur un `uint64_t` | contrôle toujours faux |
+| idem | si `fread` échoue, la fonction retourne quand même 0 | modèle « chargé » avec un contexte invalide |
+| idem | `get_outsize` : `>` au lieu de `>=` ; `get_outputs_data` indexe avant de vérifier | accès hors bornes |
+| idem | `sync_output` ignoré, tableau de taille variable (VLA), `tensor_attr` non initialisé | données périmées, code non portable |
+| `rknn_opencv.cpp` | `bool is_running` partagé entre threads | data race (comportement indéfini) |
+| idem | après une erreur de capture, l'image vide est quand même envoyée au NPU | inférence sur une image vide |
+| idem | `join()` sur des threads non démarrés, destructeur sans `stop()` | `std::terminate` |
+| idem | jusqu'à 8 images en file | jusqu'à 8 images de latence |
+| `rknn_test.cpp` | `imshow` sans affichage disponible ou sur une image vide | abort (GTK/Qt) |
+| idem | pas de gestion de SIGINT/SIGTERM, erreurs retournées comme 0, `(0,0)` (opérateur virgule) passé à `resize` | pas d'arrêt propre en service |
+| `npud` | script SysV avec `kill -9` et `$prog` non défini | remplacé par une unité systemd durcie |
+
+## /optimize
+
+- **Sélection des scores :** comparaison sur le logit brut, puis une seule sigmoïde par candidat. Avant, il y avait 172 000 `exp()` par image. Mesuré : **1,05 ms → 0,135 ms par image (×7,8)**.
+- **Décodage des boîtes :** seuls les candidats retenus sont décodés, au lieu des 1917 ancres.
+- **Sorties du NPU :** elles arrivent directement dans des buffers alloués une fois pour toutes. Ça supprime environ 700 Ko de `memcpy` et deux `malloc`/`free` par image.
+- **Latence en live :** l'image la plus ancienne en attente est recyclée, et le pilote V4L2 garde un seul buffer (`BUFFERSIZE=1`). En plus, on demande MJPG à la caméra.
+- **Compilation :** `-march=armv8.2-a`, le dénominateur commun (Cortex-A76 / A720), donc un seul `.deb` pour les deux cartes. `--native` reste disponible.
+
+## /explain
+
+```
+capture (resize+RGB) ─► file ─► thread NPU (librknn_api ─@transfer_proxy─► npu_transfer_proxy ─USB─► RK1808) ─► file ─► principal (SSD, affichage/stdout/mp4)
+```
+
+## Ce qui a été vérifié, et ce qui ne l'a pas été
+
+**Vérifié ici (x86) :**
+- Le programme tourne avec une fausse `librknn_api` : fichier vidéo, flux live GStreamer, fenêtre (Xvfb), `--headless`, `-o`.
+- Arrêt propre sur SIGINT et SIGTERM ; ASan/UBSan ne signalent rien dans notre code.
+- Cross-compilation aarch64 contre le vrai `rknn_api.h`. Tous les symboles utilisés sont bien exportés par la vraie lib 1.7.5.
+- Les scripts passent `shellcheck`, l'unité passe `systemd-analyze` (exposition 1,7) et la règle passe `udevadm verify`.
+- Le `.deb` passe `lintian` (quelques avertissements mineurs) ; installation, exécution, désinstallation et purge fonctionnent.
+
+**Non testé (pas de matériel) :**
+- La vraie clé RK1808 sur Pi 5 et Orange Pi 6 Plus.
+- Le proxy sans privilèges (`DynamicUser`). S'il refuse de démarrer, `systemctl edit npu-transfer-proxy` avec `DynamicUser=no`.
+- La compatibilité entre le firmware de votre clé et le SDK 1.7.5 (erreur -10 ou -11 = firmware à mettre à jour).
+
+## Pour committer
+
+```bash
+git rm install_rknn/script/npud
+git add .gitignore CMakeLists.txt README.md ssd_demo.cpp common/ install_rknn/install_rknn_api.sh packaging/
+chmod +x packaging/build-deb.sh packaging/debian/{postinst,prerm,postrm} install_rknn/install_rknn_api.sh
+```
+
+Pour construire et installer, sur la carte : `./packaging/build-deb.sh && sudo apt install ./dist/slave-mobilenet-ssd_1.1.0-1_arm64.deb`.
+
+---
+
+## Fichiers complets
+
+### `CMakeLists.txt`
+```cmake
+cmake_minimum_required(VERSION 3.16...3.31)
+
+project(slave_mobilenet_ssd
+	VERSION 1.1.0
+	DESCRIPTION "MobileNet-SSD demo driving a Rockchip RK1808 USB compute stick (passive mode)"
+	LANGUAGES CXX)
+
+include(GNUInstallDirs)
+
+# ---------------------------------------------------------------------------
+# Build defaults (never override a value given on the command line)
+# ---------------------------------------------------------------------------
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+	set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+option(SSD_BUNDLE_RKNN
+	"Install librknn_api.so and npu_transfer_proxy in a private directory (used by the .deb)" OFF)
+option(SSD_NATIVE_TUNING
+	"Tune for the build host CPU (-mcpu=native). Leave OFF to produce a package for both boards" OFF)
+
+set(RKNN_SDK_DIR "${CMAKE_SOURCE_DIR}/third_party/rknn" CACHE PATH
+	"Directory holding include/rockchip/rknn_api.h, lib/librknn_api.so and bin/npu_transfer_proxy")
+
+set(SSD_PKG_NAME "slave-mobilenet-ssd")
+# Fixed private directory (Debian policy: /usr/lib/<package>), independent of
+# the multiarch triplet so the systemd unit can reference it.
+set(SSD_PRIVATE_LIBDIR "lib/${SSD_PKG_NAME}")
+set(SSD_DATADIR "${CMAKE_INSTALL_DATADIR}/${SSD_PKG_NAME}/models/ssd")
+
+# ---------------------------------------------------------------------------
+# Dependencies
+# ---------------------------------------------------------------------------
+find_package(Threads REQUIRED)
+find_package(OpenCV 4 REQUIRED COMPONENTS core imgproc highgui videoio)
+
+find_path(RKNN_INCLUDE_DIR
+	NAMES rockchip/rknn_api.h
+	HINTS "${RKNN_SDK_DIR}/include"
+	PATHS /usr/local/include /usr/include)
+find_library(RKNN_LIBRARY
+	NAMES rknn_api
+	HINTS "${RKNN_SDK_DIR}/lib"
+	PATHS /usr/local/lib /usr/lib)
+
+if(NOT RKNN_INCLUDE_DIR OR NOT RKNN_LIBRARY)
+	message(FATAL_ERROR
+		"RKNN host SDK not found.\n"
+		"Run: ./install_rknn/install_rknn_api.sh --prefix ${CMAKE_SOURCE_DIR}/third_party/rknn\n"
+		"or pass -DRKNN_SDK_DIR=<dir>.")
+endif()
+message(STATUS "RKNN header : ${RKNN_INCLUDE_DIR}/rockchip/rknn_api.h")
+message(STATUS "RKNN library: ${RKNN_LIBRARY}")
+
+add_library(rknn::api SHARED IMPORTED)
+set_target_properties(rknn::api PROPERTIES
+	IMPORTED_LOCATION "${RKNN_LIBRARY}"
+	INTERFACE_INCLUDE_DIRECTORIES "${RKNN_INCLUDE_DIR}")
+
+# ---------------------------------------------------------------------------
+# Executable
+# ---------------------------------------------------------------------------
+add_executable(ssd_demo
+	ssd_demo.cpp
+	common/rknn.cpp
+	common/rknn_opencv.cpp
+	common/rknn_test.cpp)
+
+target_include_directories(ssd_demo PRIVATE ${CMAKE_SOURCE_DIR}/common)
+target_link_libraries(ssd_demo PRIVATE
+	${OpenCV_LIBS}
+	rknn::api
+	Threads::Threads)
+
+target_compile_definitions(ssd_demo PRIVATE
+	SSD_VERSION="${PROJECT_VERSION}"
+	SSD_DEFAULT_DATA_DIR="${CMAKE_INSTALL_FULL_DATADIR}/${SSD_PKG_NAME}/models/ssd")
+
+target_compile_options(ssd_demo PRIVATE
+	-Wall -Wextra -Wvla -Wformat=2
+	$<$<CONFIG:Release>:-O2>)
+
+# Both boards are ARMv8.2-A (Cortex-A76 on the Pi 5, Cortex-A720/A520 on the
+# CIX CD8180). -march=armv8.2-a is the common denominator, so one package runs
+# on both. -mcpu=native only when explicitly requested.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+	if(SSD_NATIVE_TUNING)
+		target_compile_options(ssd_demo PRIVATE -mcpu=native)
+	else()
+		target_compile_options(ssd_demo PRIVATE -march=armv8.2-a)
+	endif()
+endif()
+
+if(SSD_BUNDLE_RKNN)
+	# The proprietary librknn_api.so is shipped in a private directory so it
+	# never clashes with another RKNN SDK installed system-wide.
+	set_target_properties(ssd_demo PROPERTIES
+		INSTALL_RPATH "\$ORIGIN/../${SSD_PRIVATE_LIBDIR}"
+		BUILD_WITH_INSTALL_RPATH OFF)
+endif()
+
+# ---------------------------------------------------------------------------
+# Install
+# ---------------------------------------------------------------------------
+install(TARGETS ssd_demo RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+install(FILES
+	models/ssd/mobilenet_ssd.rknn
+	models/ssd/box_priors.txt
+	models/ssd/coco_labels_list.txt
+	DESTINATION ${SSD_DATADIR})
+
+if(SSD_BUNDLE_RKNN)
+	get_filename_component(_rknn_real "${RKNN_LIBRARY}" REALPATH)
+	install(FILES "${_rknn_real}"
+		DESTINATION ${SSD_PRIVATE_LIBDIR}
+		RENAME librknn_api.so
+		PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ)
+
+	find_program(NPU_TRANSFER_PROXY npu_transfer_proxy
+		HINTS "${RKNN_SDK_DIR}/bin" NO_DEFAULT_PATH)
+	if(NOT NPU_TRANSFER_PROXY)
+		message(FATAL_ERROR "npu_transfer_proxy not found in ${RKNN_SDK_DIR}/bin")
+	endif()
+	install(PROGRAMS "${NPU_TRANSFER_PROXY}" DESTINATION ${SSD_PRIVATE_LIBDIR})
+
+	install(FILES packaging/systemd/npu-transfer-proxy.service
+		DESTINATION lib/systemd/system)
+	install(FILES packaging/udev/60-rk1808-npu.rules
+		DESTINATION lib/udev/rules.d)
+endif()
+```
+
+### `ssd_demo.cpp`
+```cpp
+/*
+ * MobileNet-SSD (COCO, 300x300) object detection.
+ *
+ * The network runs on a Rockchip RK1808 USB compute stick in passive mode
+ * (librknn_api + npu_transfer_proxy); capture, post-processing and display
+ * run on the host (Raspberry Pi 5, Orange Pi 6 Plus, ...).
+ */
+#include <algorithm>
+#include <cerrno>
+#include <climits>
+#include <cmath>
+#include <csignal>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <memory>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include <getopt.h>
+#include <unistd.h>
+
+#include <opencv2/imgproc.hpp>
+
+#include "rknn_test.h"
+
+#ifndef SSD_VERSION
+#define SSD_VERSION "dev"
+#endif
+#ifndef SSD_DEFAULT_DATA_DIR
+#define SSD_DEFAULT_DATA_DIR "/usr/share/slave-mobilenet-ssd/models/ssd"
+#endif
+
+#define NUM_RESULTS	1917
+#define NUM_CLASSES	91
+
+static const char *WIN_NAME = "ssd";
+
+static const char *MODEL_FILE = "mobilenet_ssd.rknn";
+static const char *LABEL_FILE = "coco_labels_list.txt";
+static const char *BOX_PRIO_FILE = "box_priors.txt";
+
+static const int INPUT_WIDTH = 300;
+static const int INPUT_HEIGHT = 300;
+static const int INPUT_CHANNEL = 3;
+
+/* candidates kept (best scores first) before NMS */
+static const size_t TOP_K = 200;
+
+#define Y_SCALE  10.0f
+#define X_SCALE  10.0f
+#define H_SCALE  5.0f
+#define W_SCALE  5.0f
+
+struct detection {
+	int anchor;
+	int cls;
+	float score;
+	float ymin, xmin, ymax, xmax;
+};
+
+struct ssd_data {
+	float boxPriors[4][NUM_RESULTS];
+	std::string labels[NUM_CLASSES];
+
+	float min_score;
+	float min_logit;	/* logit(min_score), avoids 170k expf() per frame */
+	float nms_threshold;
+	size_t max_det;
+	bool print;		/* print detections on stdout */
+	unsigned long long frame;
+
+	std::vector<detection> cand;	/* scratch, reused every frame */
+	std::vector<detection> kept;
+};
+
+static const cv::Scalar colorArray[10] = {
+	cv::Scalar(139, 0, 0, 255),
+	cv::Scalar(139, 0, 139, 255),
+	cv::Scalar(0, 0, 139, 255),
+	cv::Scalar(0, 100, 0, 255),
+	cv::Scalar(139, 139, 0, 255),
+	cv::Scalar(209, 206, 0, 255),
+	cv::Scalar(0, 127, 255, 255),
+	cv::Scalar(139, 61, 72, 255),
+	cv::Scalar(0, 255, 0, 255),
+	cv::Scalar(255, 0, 0, 255),
+};
+
+/* ------------------------------------------------------------------------ */
+/* Data files                                                               */
+/* ------------------------------------------------------------------------ */
+
+static bool readable(const std::string &path)
+{
+	return !path.empty() && access(path.c_str(), R_OK) == 0;
+}
+
+static std::string exe_dir(void)
+{
+	char buf[PATH_MAX];
+	ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+
+	if (n <= 0)
+		return "";
+	buf[n] = '\0';
+
+	std::string p(buf);
+	size_t pos = p.rfind('/');
+	return pos == std::string::npos ? "" : p.substr(0, pos);
+}
+
+/*
+ * Resolution order: explicit option, $SSD_DATA_DIR, build tree next to the
+ * binary, installed tree, compiled-in default, then the original relative
+ * paths for backward compatibility.
+ */
+static std::string find_data_file(const char *name, const std::string &override_path)
+{
+	if (!override_path.empty())
+		return readable(override_path) ? override_path : "";
+
+	std::vector<std::string> dirs;
+	const char *env = getenv("SSD_DATA_DIR");
+	const std::string exe = exe_dir();
+
+	if (env && *env)
+		dirs.push_back(env);
+	if (!exe.empty()) {
+		dirs.push_back(exe + "/../models/ssd");
+		dirs.push_back(exe + "/models/ssd");
+		dirs.push_back(exe + "/../share/slave-mobilenet-ssd/models/ssd");
+	}
+	dirs.push_back(SSD_DEFAULT_DATA_DIR);
+	dirs.push_back("models/ssd");
+	dirs.push_back("../models/ssd");
+
+	for (const auto &d : dirs) {
+		std::string p = d + "/" + name;
+		if (readable(p))
+			return p;
+	}
+	return "";
+}
+
+static int loadLabelName(const std::string &locationFilename,
+			 std::string *labels, int max_labels)
+{
+	std::ifstream fin(locationFilename);
+	std::string line;
+	int lineNum = 0;
+
+	if (!fin) {
+		fprintf(stderr, "cannot open %s\n", locationFilename.c_str());
+		return -1;
+	}
+
+	while (lineNum < max_labels && std::getline(fin, line)) {
+		if (!line.empty() && line.back() == '\r')
+			line.pop_back();
+		labels[lineNum++] = line;
+	}
+
+	for (int i = lineNum; i < max_labels; i++)
+		labels[i] = "class " + std::to_string(i);
+
+	if (lineNum < max_labels)
+		fprintf(stderr, "warning: %s has %d labels, %d expected\n",
+			locationFilename.c_str(), lineNum, max_labels);
+
+	return lineNum;
+}
+
+static int loadCoderOptions(const std::string &locationFilename,
+			    float (*boxPriors)[NUM_RESULTS])
+{
+	std::ifstream fin(locationFilename);
+	std::string line;
+	int lineNum = 0;
+
+	if (!fin) {
+		fprintf(stderr, "cannot open %s\n", locationFilename.c_str());
+		return -1;
+	}
+
+	while (std::getline(fin, line)) {
+		std::replace(line.begin(), line.end(), ',', ' ');
+		std::istringstream iss(line);
+		float number;
+		int priorIndex = 0;
+
+		if (line.find_first_not_of(" \t\r") == std::string::npos)
+			continue;	/* blank line (e.g. trailing newline) */
+
+		if (lineNum >= 4) {
+			fprintf(stderr, "%s: more than 4 rows\n",
+				locationFilename.c_str());
+			return -1;
+		}
+
+		while (iss >> number) {
+			if (priorIndex >= NUM_RESULTS) {
+				priorIndex++;
+				break;
+			}
+			boxPriors[lineNum][priorIndex++] = number;
+		}
+
+		if (priorIndex != NUM_RESULTS) {
+			fprintf(stderr, "%s: row %d has %d values, %d expected\n",
+				locationFilename.c_str(), lineNum, priorIndex,
+				NUM_RESULTS);
+			return -1;
+		}
+
+		lineNum++;
+	}
+
+	if (lineNum != 4) {
+		fprintf(stderr, "%s: %d rows, 4 expected\n",
+			locationFilename.c_str(), lineNum);
+		return -1;
+	}
+
+	return 0;
+}
+
+/* ------------------------------------------------------------------------ */
+/* SSD post-processing                                                      */
+/* ------------------------------------------------------------------------ */
+
+static inline float expit(float x)
+{
+	return 1.0f / (1.0f + std::exp(-x));
+}
+
+static inline float CalculateOverlap(const detection &a, const detection &b)
+{
+	const float w = std::max(0.f, std::min(a.xmax, b.xmax) - std::max(a.xmin, b.xmin));
+	const float h = std::max(0.f, std::min(a.ymax, b.ymax) - std::max(a.ymin, b.ymin));
+	const float i = w * h;
+	const float u = (a.xmax - a.xmin) * (a.ymax - a.ymin) +
+			(b.xmax - b.xmin) * (b.ymax - b.ymin) - i;
+	return u <= 0.f ? 0.f : (i / u);
+}
+
+/* Decode one anchor only (the original decoded all 1917 every frame). */
+static inline void decodeCenterSizeBox(const float *predictions,
+				       const float (*boxPriors)[NUM_RESULTS],
+				       detection &d)
+{
+	const int i = d.anchor;
+	const float ycenter = predictions[i * 4 + 0] / Y_SCALE * boxPriors[2][i] + boxPriors[0][i];
+	const float xcenter = predictions[i * 4 + 1] / X_SCALE * boxPriors[3][i] + boxPriors[1][i];
+	const float h = std::exp(predictions[i * 4 + 2] / H_SCALE) * boxPriors[2][i];
+	const float w = std::exp(predictions[i * 4 + 3] / W_SCALE) * boxPriors[3][i];
+
+	d.ymin = ycenter - h / 2.0f;
+	d.xmin = xcenter - w / 2.0f;
+	d.ymax = ycenter + h / 2.0f;
+	d.xmax = xcenter + w / 2.0f;
+}
+
+/*
+ * Keep, for each anchor, its best class (background excluded) when the
+ * score reaches min_score. expit() is monotonic, so the comparison is done on
+ * the raw logit and the sigmoid computed once per candidate.
+ */
+static void selectCandidates(const float *outputClasses, struct ssd_data *ssd)
+{
+	ssd->cand.clear();
+
+	for (int i = 0; i < NUM_RESULTS; ++i) {
+		const float *row = outputClasses + i * NUM_CLASSES;
+		const float *best = std::max_element(row + 1, row + NUM_CLASSES);
+
+		if (*best >= ssd->min_logit) {
+			detection d;
+			d.anchor = i;
+			d.cls = static_cast<int>(best - row);
+			d.score = expit(*best);
+			d.ymin = d.xmin = d.ymax = d.xmax = 0.f;
+			ssd->cand.push_back(d);
+		}
+	}
+
+	auto by_score = [](const detection &a, const detection &b) {
+		return a.score > b.score;
+	};
+
+	if (ssd->cand.size() > TOP_K) {
+		std::nth_element(ssd->cand.begin(), ssd->cand.begin() + TOP_K,
+				 ssd->cand.end(), by_score);
+		ssd->cand.resize(TOP_K);
+	}
+	std::sort(ssd->cand.begin(), ssd->cand.end(), by_score);
+}
+
+/* Greedy class-aware NMS on score-sorted candidates. */
+static void nms(struct ssd_data *ssd)
+{
+	ssd->kept.clear();
+
+	for (const auto &c : ssd->cand) {
+		bool suppressed = false;
+
+		for (const auto &k : ssd->kept) {
+			if (k.cls == c.cls &&
+			    CalculateOverlap(c, k) >= ssd->nms_threshold) {
+				suppressed = true;
+				break;
+			}
+		}
+		if (!suppressed) {
+			ssd->kept.push_back(c);
+			if (ssd->kept.size() >= ssd->max_det)
+				break;
+		}
+	}
+}
+
+static int post_process(void *data, cv::Mat &img, float fps,
+			const struct rknn_out_data *out_data)
+{
+	char tmp_buf[64];
+	struct ssd_data *ssd = static_cast<struct ssd_data *>(data);
+	const float *predictions = nullptr;
+	const float *outputClasses = nullptr;
+
+	ssd->frame++;
+
+	/* identify outputs by size instead of trusting their order */
+	for (uint32_t i = 0; i < out_data->count; i++) {
+		const uint32_t n = out_data->size[i] / sizeof(float);
+		if (n == NUM_RESULTS * 4)
+			predictions = out_data->out[i];
+		else if (n == NUM_RESULTS * NUM_CLASSES)
+			outputClasses = out_data->out[i];
+	}
+
+	if (!predictions || !outputClasses) {
+		fprintf(stderr, "model outputs do not match MobileNet-SSD "
+			"(%d anchors x %d classes)\n", NUM_RESULTS, NUM_CLASSES);
+		return -1;
+	}
+
+	selectCandidates(outputClasses, ssd);
+	for (auto &c : ssd->cand)
+		decodeCenterSizeBox(predictions, ssd->boxPriors, c);
+	nms(ssd);
+
+	const int cols = img.cols;
+	const int rows = img.rows;
+	const float fcols = static_cast<float>(cols);
+	const float frows = static_cast<float>(rows);
+
+	for (const auto &d : ssd->kept) {
+		const int x1 = std::clamp(static_cast<int>(d.xmin * fcols), 0, cols - 1);
+		const int y1 = std::clamp(static_cast<int>(d.ymin * frows), 0, rows - 1);
+		const int x2 = std::clamp(static_cast<int>(d.xmax * fcols), 0, cols - 1);
+		const int y2 = std::clamp(static_cast<int>(d.ymax * frows), 0, rows - 1);
+		const std::string &label = ssd->labels[d.cls];
+		const cv::Scalar &color = colorArray[d.cls % 10];
+
+		if (ssd->print)
+			printf("frame %llu: %s %.2f [%d,%d,%d,%d]\n", ssd->frame,
+			       label.c_str(), d.score, x1, y1, x2, y2);
+
+		snprintf(tmp_buf, sizeof(tmp_buf), "%s %d%%", label.c_str(),
+			 static_cast<int>(d.score * 100.0f + 0.5f));
+
+		int baseline = 0;
+		const cv::Size ts = cv::getTextSize(tmp_buf, cv::FONT_HERSHEY_SIMPLEX,
+						    0.5, 1, &baseline);
+		const int ty = std::max(y1, ts.height + 4);
+
+		cv::rectangle(img, cv::Point(x1, y1), cv::Point(x2, y2), color, 2);
+		cv::rectangle(img, cv::Point(x1, ty - ts.height - 4),
+			      cv::Point(x1 + ts.width + 4, ty), color, cv::FILLED);
+		cv::putText(img, tmp_buf, cv::Point(x1 + 2, ty - 3),
+			    cv::FONT_HERSHEY_SIMPLEX, 0.5,
+			    cv::Scalar(255, 255, 255, 255), 1, cv::LINE_AA);
+	}
+
+	snprintf(tmp_buf, sizeof(tmp_buf), "FPS:%5.2f", fps);
+	/* dark outline keeps the counter readable on any background */
+	cv::putText(img, tmp_buf, cv::Point(20, 40), cv::FONT_HERSHEY_PLAIN, 2,
+		    cv::Scalar(0, 0, 0, 255), 5);
+	cv::putText(img, tmp_buf, cv::Point(20, 40), cv::FONT_HERSHEY_PLAIN, 2,
+		    cv::Scalar(0, 0, 255, 255), 2);
+
+	if (ssd->print)
+		fflush(stdout);
+
+	return 0;
+}
+
+/* ------------------------------------------------------------------------ */
+/* main                                                                     */
+/* ------------------------------------------------------------------------ */
+
+static void on_signal(int sig)
+{
+	(void)sig;
+	rknn_test::request_stop();
+}
+
+static void usage(const char *prog)
+{
+	printf("Usage: %s [options]\n"
+	       "MobileNet-SSD detection offloaded to an RK1808 USB compute stick.\n\n"
+	       "  -s, --source SRC     video source: V4L2 index, /dev/videoN, file, URL\n"
+	       "                       or GStreamer pipeline (default: first USB camera)\n"
+	       "  -W, --width N        capture width  (V4L2, default 640)\n"
+	       "  -H, --height N       capture height (V4L2, default 480)\n"
+	       "      --no-mjpg        do not request MJPG from the camera\n"
+	       "  -m, --model FILE     .rknn model     (default: %s)\n"
+	       "  -l, --labels FILE    labels file     (default: %s)\n"
+	       "  -p, --priors FILE    box priors file (default: %s)\n"
+	       "  -t, --threshold F    min score, 0..1 (default 0.40)\n"
+	       "  -n, --nms F          NMS IoU threshold, 0..1 (default 0.45)\n"
+	       "  -k, --max-det N      max detections per frame (default 50)\n"
+	       "      --headless       no window, print detections on stdout\n"
+	       "  -o, --output FILE    write the annotated video (mp4)\n"
+	       "  -q, --quiet          do not print detections\n"
+	       "  -V, --version        print version\n"
+	       "  -h, --help           this help\n\n"
+	       "Data files are searched in $SSD_DATA_DIR, next to the binary, then in\n"
+	       "%s.\n",
+	       prog, MODEL_FILE, LABEL_FILE, BOX_PRIO_FILE, SSD_DEFAULT_DATA_DIR);
+}
+
+static bool parse_float(const char *s, float lo, float hi, float *out)
+{
+	char *end = nullptr;
+	errno = 0;
+	float v = strtof(s, &end);
+	if (errno || end == s || *end || v < lo || v > hi)
+		return false;
+	*out = v;
+	return true;
+}
+
+static bool parse_int(const char *s, long lo, long hi, int *out)
+{
+	char *end = nullptr;
+	errno = 0;
+	long v = strtol(s, &end, 10);
+	if (errno || end == s || *end || v < lo || v > hi)
+		return false;
+	*out = static_cast<int>(v);
+	return true;
+}
+
+int main(int argc, char **argv)
+{
+	int ret;
+	std::string model_opt, label_opt, prior_opt;
+	rknn_run_options run_opt;
+	float min_score = 0.4f;
+	float nms_threshold = 0.45f;
+	int max_det = 50;
+	bool quiet = false;
+
+	enum { OPT_NO_MJPG = 1000, OPT_HEADLESS };
+	static const struct option long_opts[] = {
+		{ "source",    required_argument, nullptr, 's' },
+		{ "width",     required_argument, nullptr, 'W' },
+		{ "height",    required_argument, nullptr, 'H' },
+		{ "no-mjpg",   no_argument,       nullptr, OPT_NO_MJPG },
+		{ "model",     required_argument, nullptr, 'm' },
+		{ "labels",    required_argument, nullptr, 'l' },
+		{ "priors",    required_argument, nullptr, 'p' },
+		{ "threshold", required_argument, nullptr, 't' },
+		{ "nms",       required_argument, nullptr, 'n' },
+		{ "max-det",   required_argument, nullptr, 'k' },
+		{ "headless",  no_argument,       nullptr, OPT_HEADLESS },
+		{ "output",    required_argument, nullptr, 'o' },
+		{ "quiet",     no_argument,       nullptr, 'q' },
+		{ "version",   no_argument,       nullptr, 'V' },
+		{ "help",      no_argument,       nullptr, 'h' },
+		{ nullptr, 0, nullptr, 0 },
+	};
+
+	/* line buffered even when piped (journald, tee, ...) */
+	setvbuf(stdout, nullptr, _IOLBF, 0);
+
+	int c;
+	while ((c = getopt_long(argc, argv, "s:W:H:m:l:p:t:n:k:o:qVh",
+				long_opts, nullptr)) != -1) {
+		switch (c) {
+		case 's': run_opt.source = optarg; break;
+		case 'W':
+			if (!parse_int(optarg, 16, 7680, &run_opt.cap_width)) {
+				fprintf(stderr, "invalid width: %s\n", optarg);
+				return EXIT_FAILURE;
+			}
+			break;
+		case 'H':
+			if (!parse_int(optarg, 16, 4320, &run_opt.cap_height)) {
+				fprintf(stderr, "invalid height: %s\n", optarg);
+				return EXIT_FAILURE;
+			}
+			break;
+		case OPT_NO_MJPG: run_opt.mjpg = false; break;
+		case 'm': model_opt = optarg; break;
+		case 'l': label_opt = optarg; break;
+		case 'p': prior_opt = optarg; break;
+		case 't':
+			if (!parse_float(optarg, 0.01f, 0.99f, &min_score)) {
+				fprintf(stderr, "invalid threshold: %s\n", optarg);
+				return EXIT_FAILURE;
+			}
+			break;
+		case 'n':
+			if (!parse_float(optarg, 0.0f, 1.0f, &nms_threshold)) {
+				fprintf(stderr, "invalid nms: %s\n", optarg);
+				return EXIT_FAILURE;
+			}
+			break;
+		case 'k':
+			if (!parse_int(optarg, 1, 1000, &max_det)) {
+				fprintf(stderr, "invalid max-det: %s\n", optarg);
+				return EXIT_FAILURE;
+			}
+			break;
+		case OPT_HEADLESS: run_opt.headless = true; break;
+		case 'o': run_opt.output = optarg; break;
+		case 'q': quiet = true; break;
+		case 'V': printf("ssd_demo %s\n", SSD_VERSION); return EXIT_SUCCESS;
+		case 'h': usage(argv[0]); return EXIT_SUCCESS;
+		default:  usage(argv[0]); return EXIT_FAILURE;
+		}
+	}
+	if (optind < argc) {
+		fprintf(stderr, "unexpected argument: %s\n", argv[optind]);
+		return EXIT_FAILURE;
+	}
+
+	struct sigaction sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = on_signal;
+	sigemptyset(&sa.sa_mask);
+	sigaction(SIGINT, &sa, nullptr);
+	sigaction(SIGTERM, &sa, nullptr);
+	signal(SIGPIPE, SIG_IGN);
+
+	/* load label and boxPriors */
+	const std::string label_path = find_data_file(LABEL_FILE, label_opt);
+	if (label_path.empty()) {
+		fprintf(stderr, "need label file (%s).\n", LABEL_FILE);
+		return EXIT_FAILURE;
+	}
+
+	const std::string box_path = find_data_file(BOX_PRIO_FILE, prior_opt);
+	if (box_path.empty()) {
+		fprintf(stderr, "need box priors file (%s).\n", BOX_PRIO_FILE);
+		return EXIT_FAILURE;
+	}
+
+	const std::string model_path = find_data_file(MODEL_FILE, model_opt);
+	if (model_path.empty()) {
+		fprintf(stderr, "need model file (%s).\n", MODEL_FILE);
+		return EXIT_FAILURE;
+	}
+
+	/* ~31 KB of priors + scratch: keep it off the stack */
+	std::unique_ptr<ssd_data> data(new ssd_data());
+	data->min_score = min_score;
+	data->min_logit = std::log(min_score / (1.0f - min_score));
+	data->nms_threshold = nms_threshold;
+	data->max_det = static_cast<size_t>(max_det);
+	data->print = run_opt.headless && !quiet;
+	data->frame = 0;
+	data->cand.reserve(NUM_RESULTS);
+	data->kept.reserve(static_cast<size_t>(max_det));
+
+	if (loadLabelName(label_path, data->labels, NUM_CLASSES) < 0)
+		return EXIT_FAILURE;
+	if (loadCoderOptions(box_path, data->boxPriors) < 0)
+		return EXIT_FAILURE;
+
+	rknn_test test(WIN_NAME);
+
+	ret = test.load_model(model_path.c_str());
+	if (ret < 0) {
+		fprintf(stderr, "load_model error!!!\n");
+		return EXIT_FAILURE;
+	}
+
+	ret = test.set_input_info(INPUT_WIDTH, INPUT_HEIGHT, INPUT_CHANNEL);
+	if (ret < 0) {
+		fprintf(stderr, "set_input_info error!!!\n");
+		return EXIT_FAILURE;
+	}
+
+	ret = test.run(run_opt, post_process, data.get());
+
+	return ret < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+}
+```
+
+### `common/rknn.h`
+```cpp
+#ifndef RKNN_H
+#define RKNN_H
+
+#include <cstdint>
+#include <vector>
+
+#include "rockchip/rknn_api.h"
+
+/*
+ * Thin RAII wrapper around the RKNN v1 C API (librknn_api 1.7.x, host side).
+ *
+ * On a Raspberry Pi 5 / Orange Pi 6 Plus the library does not talk to a local
+ * NPU: it forwards every call through npu_transfer_proxy to an RK1808 compute
+ * stick plugged on USB (passive mode).
+ *
+ * Not thread-safe: a context must be driven by a single thread.
+ */
+class rknn {
+private:
+	bool initialized;
+	bool has_run;
+	rknn_context rknn_ctx;
+	rknn_input_output_num in_out_num;
+	std::vector<rknn_tensor_attr> in_attrs;
+	std::vector<rknn_tensor_attr> out_attrs;
+	std::vector<rknn_output> outputs;	/* reused for every frame */
+
+	void release(void);
+
+public:
+	rknn();
+	~rknn();
+
+	rknn(const rknn &) = delete;
+	rknn &operator=(const rknn &) = delete;
+
+	int load_model(const char *model_path, uint32_t flag);
+
+	int query(rknn_query_cmd cmd, void *info, uint32_t info_len);
+
+	int set_input(uint32_t index, void *buf, uint32_t len);
+
+	int run(rknn_run_extend *extend);
+
+	int get_in_out_num(rknn_input_output_num *in_out) const;
+
+	/* Size in bytes of output @index once converted to float. */
+	int get_outsize(uint32_t index, uint32_t *size) const;
+
+	const rknn_tensor_attr *input_attr(uint32_t index) const;
+
+	const rknn_tensor_attr *output_attr(uint32_t index) const;
+
+	/*
+	 * Fetch all outputs of the last run() as float, directly into the caller
+	 * buffers (no intermediate copy). @bufs and @sizes hold @count entries,
+	 * @count must equal the number of model outputs.
+	 */
+	int get_outputs(float *const *bufs, const uint32_t *sizes,
+			uint32_t count, rknn_output_extend *extend);
+};
+
+#endif
+```
+
+### `common/rknn.cpp`
+```cpp
+#include "rknn.h"
+
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <limits>
+
+static const char *rknn_err_str(int err)
+{
+	switch (err) {
+	case RKNN_ERR_FAIL:			return "execution failed";
+	case RKNN_ERR_TIMEOUT:			return "timeout";
+	case RKNN_ERR_DEVICE_UNAVAILABLE:	return "device unavailable";
+	case RKNN_ERR_MALLOC_FAIL:		return "memory allocation failed";
+	case RKNN_ERR_PARAM_INVALID:		return "invalid parameter";
+	case RKNN_ERR_MODEL_INVALID:		return "invalid model";
+	case RKNN_ERR_CTX_INVALID:		return "invalid context";
+	case RKNN_ERR_INPUT_INVALID:		return "invalid input";
+	case RKNN_ERR_OUTPUT_INVALID:		return "invalid output";
+	case RKNN_ERR_DEVICE_UNMATCH:		return "device/SDK mismatch, update the stick firmware";
+	case RKNN_ERR_INCOMPATILE_PRE_COMPILE_MODEL:
+		return "pre-compiled model incompatible with the NPU driver";
+	default:				return "unknown error";
+	}
+}
+
+rknn::rknn()
+	: initialized(false), has_run(false), rknn_ctx(0)
+{
+	memset(&in_out_num, 0, sizeof(in_out_num));
+}
+
+rknn::~rknn()
+{
+	release();
+}
+
+void rknn::release(void)
+{
+	if (initialized)
+		rknn_destroy(rknn_ctx);
+
+	initialized = false;
+	has_run = false;
+	rknn_ctx = 0;
+	memset(&in_out_num, 0, sizeof(in_out_num));
+	in_attrs.clear();
+	out_attrs.clear();
+	outputs.clear();
+}
+
+int rknn::load_model(const char *model_path, uint32_t flag)
+{
+	int ret;
+
+	if (!model_path)
+		return RKNN_ERR_PARAM_INVALID;
+
+	/* allow reloading a model on the same object */
+	release();
+
+	std::ifstream fin(model_path, std::ios::binary | std::ios::ate);
+	if (!fin) {
+		fprintf(stderr, "cannot open model %s: %s\n", model_path,
+			strerror(errno));
+		return RKNN_ERR_MODEL_INVALID;
+	}
+
+	const std::streamoff len = fin.tellg();
+	if (len <= 0 ||
+	    static_cast<unsigned long long>(len) >
+	    std::numeric_limits<uint32_t>::max()) {
+		fprintf(stderr, "invalid model size for %s\n", model_path);
+		return RKNN_ERR_MODEL_INVALID;
+	}
+
+	std::vector<unsigned char> model(static_cast<size_t>(len));
+	fin.seekg(0, std::ios::beg);
+	if (!fin.read(reinterpret_cast<char *>(model.data()), len)) {
+		fprintf(stderr, "short read on %s\n", model_path);
+		return RKNN_ERR_MODEL_INVALID;
+	}
+
+	printf("loading model %s (%lld bytes)...\n", model_path,
+	       static_cast<long long>(len));
+
+	ret = rknn_init(&rknn_ctx, model.data(), static_cast<uint32_t>(len),
+			flag);
+	if (ret < 0) {
+		fprintf(stderr, "rknn_init failed: %d (%s)\n", ret,
+			rknn_err_str(ret));
+		if (ret == RKNN_ERR_DEVICE_UNAVAILABLE || ret == RKNN_ERR_FAIL)
+			fprintf(stderr,
+				"hint: is the RK1808 stick plugged in and is "
+				"'systemctl status npu-transfer-proxy' active?\n");
+		rknn_ctx = 0;
+		return ret;
+	}
+	initialized = true;
+
+	rknn_sdk_version ver;
+	memset(&ver, 0, sizeof(ver));
+	if (rknn_query(rknn_ctx, RKNN_QUERY_SDK_VERSION, &ver,
+		       sizeof(ver)) == 0)
+		printf("rknn api: %.*s, driver: %.*s\n",
+		       static_cast<int>(sizeof(ver.api_version)), ver.api_version,
+		       static_cast<int>(sizeof(ver.drv_version)), ver.drv_version);
+
+	ret = rknn_query(rknn_ctx, RKNN_QUERY_IN_OUT_NUM, &in_out_num,
+			 sizeof(in_out_num));
+	if (ret < 0) {
+		fprintf(stderr, "query in/out num failed: %d\n", ret);
+		goto fail;
+	}
+
+	printf("input num = %u, output num = %u\n",
+	       in_out_num.n_input, in_out_num.n_output);
+
+	for (uint32_t i = 0; i < in_out_num.n_input; i++) {
+		rknn_tensor_attr attr;
+		memset(&attr, 0, sizeof(attr));
+		attr.index = i;
+		ret = rknn_query(rknn_ctx, RKNN_QUERY_INPUT_ATTR, &attr,
+				 sizeof(attr));
+		if (ret < 0)
+			goto fail;
+		printf("input  %u: %.*s, n_elems = %u, fmt = %d, type = %d\n",
+		       i, RKNN_MAX_NAME_LEN, attr.name, attr.n_elems,
+		       attr.fmt, attr.type);
+		in_attrs.push_back(attr);
+	}
+
+	for (uint32_t i = 0; i < in_out_num.n_output; i++) {
+		rknn_tensor_attr attr;
+		memset(&attr, 0, sizeof(attr));
+		attr.index = i;
+		ret = rknn_query(rknn_ctx, RKNN_QUERY_OUTPUT_ATTR, &attr,
+				 sizeof(attr));
+		if (ret < 0)
+			goto fail;
+		printf("output %u: %.*s, n_elems = %u, type = %02x, qnt_type = %02x\n",
+		       i, RKNN_MAX_NAME_LEN, attr.name, attr.n_elems,
+		       attr.type, attr.qnt_type);
+		out_attrs.push_back(attr);
+	}
+
+	outputs.resize(in_out_num.n_output);
+	return 0;
+
+fail:
+	release();
+	return ret < 0 ? ret : RKNN_ERR_MODEL_INVALID;
+}
+
+int rknn::query(rknn_query_cmd cmd, void *info, uint32_t info_len)
+{
+	if (!info)
+		return RKNN_ERR_PARAM_INVALID;
+	if (!initialized)
+		return RKNN_ERR_CTX_INVALID;
+
+	return rknn_query(rknn_ctx, cmd, info, info_len);
+}
+
+int rknn::set_input(uint32_t index, void *buf, uint32_t len)
+{
+	rknn_input input;
+
+	if (!buf || !len)
+		return RKNN_ERR_PARAM_INVALID;
+	if (!initialized)
+		return RKNN_ERR_CTX_INVALID;
+	if (index >= in_out_num.n_input)
+		return RKNN_ERR_INPUT_INVALID;
+
+	memset(&input, 0, sizeof(input));
+	input.index = index;
+	input.buf = buf;
+	input.size = len;
+	input.pass_through = 0;
+	input.type = RKNN_TENSOR_UINT8;
+	input.fmt = RKNN_TENSOR_NHWC;
+
+	return rknn_inputs_set(rknn_ctx, 1, &input);
+}
+
+int rknn::run(rknn_run_extend *extend)
+{
+	int ret;
+
+	if (!initialized)
+		return RKNN_ERR_CTX_INVALID;
+
+	ret = rknn_run(rknn_ctx, extend);
+	has_run = (ret == 0);
+
+	return ret;
+}
+
+int rknn::get_in_out_num(rknn_input_output_num *in_out) const
+{
+	if (!in_out)
+		return RKNN_ERR_PARAM_INVALID;
+	if (!initialized)
+		return RKNN_ERR_CTX_INVALID;
+
+	*in_out = in_out_num;
+	return 0;
+}
+
+int rknn::get_outsize(uint32_t index, uint32_t *size) const
+{
+	if (!size)
+		return RKNN_ERR_PARAM_INVALID;
+
+	*size = 0;
+
+	if (!initialized)
+		return RKNN_ERR_CTX_INVALID;
+	if (index >= out_attrs.size())
+		return RKNN_ERR_OUTPUT_INVALID;
+
+	*size = out_attrs[index].n_elems * sizeof(float);
+	return 0;
+}
+
+const rknn_tensor_attr *rknn::input_attr(uint32_t index) const
+{
+	return index < in_attrs.size() ? &in_attrs[index] : nullptr;
+}
+
+const rknn_tensor_attr *rknn::output_attr(uint32_t index) const
+{
+	return index < out_attrs.size() ? &out_attrs[index] : nullptr;
+}
+
+int rknn::get_outputs(float *const *bufs, const uint32_t *sizes,
+		      uint32_t count, rknn_output_extend *extend)
+{
+	int ret;
+	rknn_output_extend local_ext;
+
+	if (!bufs || !sizes)
+		return RKNN_ERR_PARAM_INVALID;
+	if (!initialized)
+		return RKNN_ERR_CTX_INVALID;
+	if (count != in_out_num.n_output || !has_run)
+		return RKNN_ERR_OUTPUT_INVALID;
+
+	for (uint32_t i = 0; i < count; i++) {
+		const uint32_t need = out_attrs[i].n_elems * sizeof(float);
+
+		if (!bufs[i] || sizes[i] < need)
+			return RKNN_ERR_PARAM_INVALID;
+
+		memset(&outputs[i], 0, sizeof(outputs[i]));
+		outputs[i].want_float = 1;
+		outputs[i].is_prealloc = 1;
+		outputs[i].index = i;
+		outputs[i].buf = bufs[i];
+		outputs[i].size = need;
+	}
+
+	memset(&local_ext, 0, sizeof(local_ext));
+	ret = rknn_outputs_get(rknn_ctx, count, outputs.data(),
+			       extend ? extend : &local_ext);
+	if (ret < 0)
+		return ret;
+
+	/* one rknn_run() -> one rknn_outputs_get() */
+	has_run = false;
+
+	return rknn_outputs_release(rknn_ctx, count, outputs.data());
+}
+```
+
+### `common/rknn_opencv.h`
+```cpp
+#ifndef RKNN_OPENCV_H
+#define RKNN_OPENCV_H
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <deque>
+#include <mutex>
+#include <thread>
+#include <vector>
+
+#include <opencv2/core.hpp>
+
+#define RKNN_MAX_OUTPUTS 8
+
+/* Pipeline end codes returned by the get_img callback. */
+#define RKNN_PIPE_EOF   1	/* end of stream: drain and stop, not an error */
+
+/* Inference results of one frame. Buffers are owned by the pipeline. */
+struct rknn_out_data {
+	float *out[RKNN_MAX_OUTPUTS];
+	uint32_t size[RKNN_MAX_OUTPUTS];	/* bytes */
+	uint32_t count;
+};
+
+struct rknn_queue_data {
+	cv::Mat img_origin;		/* frame as captured (BGR), drawn on */
+	cv::Mat img_resize;		/* network input (RGB, model size)   */
+	uint64_t frame_id;
+	struct rknn_out_data out_data;
+	std::vector<float> storage[RKNN_MAX_OUTPUTS];
+};
+
+/*
+ * get_img:    fill origin/resize. Returns 0, RKNN_PIPE_EOF or < 0 on error.
+ * detect_img: run the network on resize, fill out_data. Returns 0 or < 0.
+ * show_img:   consume one result (main thread). Returns 0 or < 0.
+ */
+typedef int (*rknn_get_img_fn)(void *ctx, cv::Mat &origin, cv::Mat &resize);
+typedef int (*rknn_detect_img_fn)(void *ctx, cv::Mat &resize,
+				  struct rknn_out_data *out_data);
+typedef int (*rknn_show_img_fn)(void *ctx, cv::Mat &origin, float fps,
+				struct rknn_out_data *out_data);
+
+/*
+ * Three stage pipeline:
+ *   capture thread -> input queue -> NPU thread -> output queue -> caller
+ *
+ * With drop_frames (live cameras) the capture thread recycles the oldest
+ * frame still waiting for the NPU instead of queueing behind it, so the
+ * latency stays at about one frame whatever the NPU speed. Without it (video
+ * files) every frame is processed.
+ */
+class rknn_opencv {
+private:
+	std::vector<rknn_queue_data> slots;
+	std::deque<rknn_queue_data *> idle_queue;
+	std::deque<rknn_queue_data *> input_queue;
+	std::deque<rknn_queue_data *> output_queue;
+
+	std::mutex mtx;
+	std::condition_variable cond_idle;
+	std::condition_variable cond_input;
+	std::condition_variable cond_output;
+
+	std::atomic<bool> is_running;
+	std::atomic<bool> capture_done;
+	std::atomic<bool> detect_done;
+	std::atomic<int> last_error;
+	bool drop_frames;
+
+	uint64_t next_frame_id;
+	std::atomic<uint64_t> dropped_frames;
+
+	float fps;
+	int frame_count;
+	std::chrono::steady_clock::time_point last_time;
+
+	void *user_ctx_ptr;
+	rknn_get_img_fn get_img_func;
+	rknn_detect_img_fn detect_img_func;
+	rknn_show_img_fn show_img_func;
+
+	std::thread thread_get_img;
+	std::thread thread_detect_img;
+
+	void get_img_task(void);
+	void detect_img_task(void);
+
+public:
+	explicit rknn_opencv(unsigned int slot_count = 4);
+	~rknn_opencv();
+
+	rknn_opencv(const rknn_opencv &) = delete;
+	rknn_opencv &operator=(const rknn_opencv &) = delete;
+
+	/* @out_sizes: byte size of every model output (float). */
+	int start(rknn_get_img_fn get_img, rknn_detect_img_fn detect_img,
+		  rknn_show_img_fn show_img, void *user_ctx,
+		  const std::vector<uint32_t> &out_sizes, bool drop);
+
+	/*
+	 * Display one processed frame if available.
+	 * Returns 1 when a frame was shown, 0 on timeout, -1 when the pipeline
+	 * is finished (see error()) or the show callback's negative code.
+	 */
+	int update_show(void);
+
+	int stop(void);
+
+	/* First error raised by a worker thread, 0 if none. */
+	int error(void) const { return last_error.load(); }
+
+	uint64_t dropped(void) const { return dropped_frames.load(); }
+};
+
+#endif
+```
+
+### `common/rknn_opencv.cpp`
+```cpp
+#include "rknn_opencv.h"
+
+#include <cstdio>
+#include <cstring>
+#include <system_error>
+
+static const std::chrono::milliseconds con_var_time_out(100);
+
+rknn_opencv::rknn_opencv(unsigned int slot_count)
+	: slots(slot_count < 2 ? 2 : slot_count),
+	  is_running(false), capture_done(false), detect_done(false),
+	  last_error(0), drop_frames(true),
+	  next_frame_id(0), dropped_frames(0),
+	  fps(0.0f), frame_count(0),
+	  last_time(std::chrono::steady_clock::now()),
+	  user_ctx_ptr(nullptr),
+	  get_img_func(nullptr), detect_img_func(nullptr),
+	  show_img_func(nullptr)
+{
+	for (auto &slot : slots) {
+		memset(&slot.out_data, 0, sizeof(slot.out_data));
+		slot.frame_id = 0;
+		idle_queue.push_back(&slot);
+	}
+}
+
+rknn_opencv::~rknn_opencv()
+{
+	stop();
+}
+
+void rknn_opencv::get_img_task(void)
+{
+	int ret;
+
+	while (is_running) {
+		rknn_queue_data *img = nullptr;
+
+		{
+			std::unique_lock<std::mutex> lock(mtx);
+
+			if (!idle_queue.empty()) {
+				img = idle_queue.front();
+				idle_queue.pop_front();
+			} else if (drop_frames && !input_queue.empty()) {
+				/* NPU is behind: reuse the stalest pending frame */
+				img = input_queue.front();
+				input_queue.pop_front();
+				dropped_frames++;
+			} else {
+				cond_idle.wait_for(lock, con_var_time_out);
+				continue;
+			}
+		}
+
+		ret = (*get_img_func)(user_ctx_ptr, img->img_origin,
+				      img->img_resize);
+
+		std::lock_guard<std::mutex> lock(mtx);
+
+		if (ret != 0) {
+			idle_queue.push_back(img);
+			if (ret < 0) {
+				fprintf(stderr, "get_img error [%d], stopping\n",
+					ret);
+				int expected = 0;
+				last_error.compare_exchange_strong(expected, ret);
+				is_running = false;
+			}
+			break;
+		}
+
+		img->frame_id = next_frame_id++;
+		input_queue.push_back(img);
+		cond_input.notify_one();
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(mtx);
+		capture_done = true;
+	}
+	cond_input.notify_all();
+	cond_output.notify_all();
+}
+
+void rknn_opencv::detect_img_task(void)
+{
+	int ret;
+
+	while (is_running) {
+		rknn_queue_data *img = nullptr;
+
+		{
+			std::unique_lock<std::mutex> lock(mtx);
+
+			cond_input.wait_for(lock, con_var_time_out, [this] {
+				return !input_queue.empty() || capture_done ||
+				       !is_running;
+			});
+
+			if (!is_running)
+				break;
+
+			if (input_queue.empty()) {
+				if (capture_done)
+					break;	/* drained */
+				continue;
+			}
+
+			img = input_queue.front();
+			input_queue.pop_front();
+		}
+
+		ret = (*detect_img_func)(user_ctx_ptr, img->img_resize,
+					 &img->out_data);
+
+		std::lock_guard<std::mutex> lock(mtx);
+
+		if (ret < 0) {
+			fprintf(stderr, "detect_img error [%d], stopping\n", ret);
+			int expected = 0;
+			last_error.compare_exchange_strong(expected, ret);
+			is_running = false;
+			idle_queue.push_back(img);
+			cond_idle.notify_all();
+			break;
+		}
+
+		output_queue.push_back(img);
+		cond_output.notify_one();
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(mtx);
+		detect_done = true;
+	}
+	cond_output.notify_all();
+	cond_idle.notify_all();
+}
+
+int rknn_opencv::start(rknn_get_img_fn get_img, rknn_detect_img_fn detect_img,
+		       rknn_show_img_fn show_img, void *user_ctx,
+		       const std::vector<uint32_t> &out_sizes, bool drop)
+{
+	if (!get_img || !detect_img || !show_img)
+		return -1;
+	if (out_sizes.empty() || out_sizes.size() > RKNN_MAX_OUTPUTS) {
+		fprintf(stderr, "unsupported number of outputs: %zu (max %d)\n",
+			out_sizes.size(), RKNN_MAX_OUTPUTS);
+		return -1;
+	}
+	if (is_running || thread_get_img.joinable() ||
+	    thread_detect_img.joinable())
+		return -1;
+
+	/* allocate every output buffer once, reused for the whole run */
+	for (auto &slot : slots) {
+		memset(&slot.out_data, 0, sizeof(slot.out_data));
+		for (size_t i = 0; i < out_sizes.size(); i++) {
+			const size_t n = (out_sizes[i] + sizeof(float) - 1) /
+					 sizeof(float);
+			slot.storage[i].assign(n, 0.0f);
+			slot.out_data.out[i] = slot.storage[i].data();
+			slot.out_data.size[i] = out_sizes[i];
+		}
+		slot.out_data.count = static_cast<uint32_t>(out_sizes.size());
+	}
+
+	get_img_func = get_img;
+	detect_img_func = detect_img;
+	show_img_func = show_img;
+	user_ctx_ptr = user_ctx;
+	drop_frames = drop;
+
+	capture_done = false;
+	detect_done = false;
+	last_error = 0;
+	is_running = true;
+	frame_count = 0;
+	last_time = std::chrono::steady_clock::now();
+
+	try {
+		thread_get_img = std::thread(&rknn_opencv::get_img_task, this);
+		thread_detect_img = std::thread(&rknn_opencv::detect_img_task,
+						this);
+	} catch (const std::system_error &e) {
+		fprintf(stderr, "cannot create thread: %s\n", e.what());
+		stop();
+		return -1;
+	}
+
+	return 0;
+}
+
+int rknn_opencv::update_show(void)
+{
+	int ret;
+	rknn_queue_data *img = nullptr;
+
+	{
+		std::unique_lock<std::mutex> lock(mtx);
+
+		cond_output.wait_for(lock, con_var_time_out, [this] {
+			return !output_queue.empty() || detect_done ||
+			       !is_running;
+		});
+
+		if (output_queue.empty())
+			return (detect_done || !is_running) ? -1 : 0;
+
+		img = output_queue.front();
+		output_queue.pop_front();
+	}
+
+	frame_count++;
+	const auto cur_time = std::chrono::steady_clock::now();
+	const float elapsed =
+		std::chrono::duration<float>(cur_time - last_time).count();
+	if (elapsed >= 1.0f) {
+		fps = static_cast<float>(frame_count) / elapsed;
+		last_time = cur_time;
+		frame_count = 0;
+	}
+
+	ret = (*show_img_func)(user_ctx_ptr, img->img_origin, fps,
+			       &img->out_data);
+
+	{
+		std::lock_guard<std::mutex> lock(mtx);
+		idle_queue.push_back(img);
+	}
+	cond_idle.notify_one();
+
+	return ret < 0 ? ret : 1;
+}
+
+int rknn_opencv::stop(void)
+{
+	{
+		std::lock_guard<std::mutex> lock(mtx);
+		is_running = false;
+	}
+
+	cond_idle.notify_all();
+	cond_input.notify_all();
+	cond_output.notify_all();
+
+	/* the capture thread may sit in a blocking read for one frame period */
+	if (thread_get_img.joinable())
+		thread_get_img.join();
+	if (thread_detect_img.joinable())
+		thread_detect_img.join();
+
+	/* give every slot back so the object can be restarted */
+	std::lock_guard<std::mutex> lock(mtx);
+	idle_queue.clear();
+	input_queue.clear();
+	output_queue.clear();
+	for (auto &slot : slots)
+		idle_queue.push_back(&slot);
+
+	return 0;
+}
+```
+
+### `common/rknn_test.h`
+```cpp
+#ifndef RKNN_TEST_H
+#define RKNN_TEST_H
+
+#include <atomic>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include <opencv2/core.hpp>
+#include <opencv2/videoio.hpp>
+
+#include "rknn.h"
+#include "rknn_opencv.h"
+
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+#endif
+
+typedef int (*rknn_post_process_fn)(void *data, cv::Mat &img, float fps,
+				    const struct rknn_out_data *out_data);
+
+struct rknn_run_options {
+	/*
+	 * Video source:
+	 *   ""                 first UVC (USB) camera found in /dev/video*
+	 *   "2"                V4L2 index
+	 *   "/dev/video8"      V4L2 device node
+	 *   "a ! b ! appsink"  GStreamer pipeline (e.g. libcamerasrc on a Pi 5)
+	 *   anything else      file or URL (FFmpeg backend)
+	 */
+	std::string source;
+	int cap_width = 640;
+	int cap_height = 480;
+	bool mjpg = true;		/* ask MJPG to UVC cameras (USB bandwidth) */
+	bool headless = false;		/* no window (SSH, service, no compositor) */
+	std::string output;		/* optional annotated video file */
+};
+
+class rknn_test {
+private:
+	bool is_model_load;
+
+	class rknn rknn_api;
+	std::string win_name;
+	cv::VideoCapture cap;
+	cv::VideoWriter writer;
+	std::vector<uint32_t> output_size;	/* bytes, float */
+
+	uint32_t input_index;
+	int img_width;
+	int img_height;
+	int img_channels;
+	bool headless;
+	bool live_source;
+	std::string output_path;
+	double source_fps;
+
+	unsigned long detect_time;
+	unsigned long detect_count;
+	unsigned long show_time;
+	unsigned long show_count;
+
+	void *user_data;
+	rknn_post_process_fn post_process;
+
+	static std::atomic<bool> stop_requested;
+
+	static unsigned long get_time(void);
+	static int get_img(void *ctx, cv::Mat &origin, cv::Mat &resize);
+	static int detect_img(void *ctx, cv::Mat &img,
+			      struct rknn_out_data *out_data);
+	static int show_img(void *ctx, cv::Mat &img, float fps,
+			    struct rknn_out_data *out_data);
+
+	int open_source(const rknn_run_options &opt);
+	int common_run(rknn_post_process_fn func, void *data);
+
+public:
+	explicit rknn_test(const char *test_name);
+	~rknn_test();
+
+	rknn_test(const rknn_test &) = delete;
+	rknn_test &operator=(const rknn_test &) = delete;
+
+	int load_model(const char *path);
+	int set_input_info(int width, int height, int channels);
+
+	uint32_t output_count(void) const
+	{
+		return static_cast<uint32_t>(output_size.size());
+	}
+	/* number of float elements of output @index, 0 if out of range */
+	uint32_t output_elems(uint32_t index) const;
+
+	int run(const rknn_run_options &opt, rknn_post_process_fn func,
+		void *data);
+
+	/* kept for compatibility with the original API */
+	int run(int video_node, rknn_post_process_fn func, void *data);
+	int run(const char *video_name, rknn_post_process_fn func, void *data);
+
+	/* async-signal-safe: may be called from a SIGINT/SIGTERM handler */
+	static void request_stop(void) { stop_requested.store(true); }
+
+	/* first UVC capture node, then any capture node, "" if none */
+	static std::string find_camera(void);
+};
+
+#endif
+```
+
+### `common/rknn_test.cpp`
+```cpp
+#include "rknn_test.h"
+
+#include <cctype>
+#include <cerrno>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#include <linux/videodev2.h>
+
+#include <opencv2/highgui.hpp>
+#include <opencv2/imgproc.hpp>
+
+std::atomic<bool> rknn_test::stop_requested(false);
+
+static const unsigned long STATS_PERIOD = 100;	/* frames */
+
+rknn_test::rknn_test(const char *test_name)
+	: is_model_load(false),
+	  win_name(test_name ? test_name : "rknn"),
+	  input_index(0), img_width(0), img_height(0), img_channels(0),
+	  headless(false), live_source(true), source_fps(25.0),
+	  detect_time(0), detect_count(0), show_time(0), show_count(0),
+	  user_data(nullptr), post_process(nullptr)
+{
+}
+
+rknn_test::~rknn_test(void)
+{
+	if (writer.isOpened())
+		writer.release();
+	if (cap.isOpened())
+		cap.release();
+}
+
+unsigned long rknn_test::get_time(void)
+{
+	using namespace std::chrono;
+	return static_cast<unsigned long>(duration_cast<milliseconds>(
+		steady_clock::now().time_since_epoch()).count());
+}
+
+/* ------------------------------------------------------------------------ */
+/* Video source                                                             */
+/* ------------------------------------------------------------------------ */
+
+static bool is_number(const std::string &s)
+{
+	if (s.empty())
+		return false;
+	for (unsigned char c : s)
+		if (!isdigit(c))
+			return false;
+	return true;
+}
+
+std::string rknn_test::find_camera(void)
+{
+	/*
+	 * On a Raspberry Pi 5, /dev/video0..7 belong to the RP1 CFE / PiSP
+	 * (raw Bayer, unusable by OpenCV), and on the Orange Pi 6 Plus the low
+	 * nodes belong to the VPU/ISP. Pick the first UVC camera instead of
+	 * blindly opening index 0.
+	 */
+	static const char *const skip_drivers[] = {
+		"rp1-cfe", "pispbe", "bcm2835-isp", "bcm2835-codec",
+		"unicam", "rpi-hevc-dec", "hantro-vpu",
+	};
+	std::string fallback;
+
+	for (int i = 0; i < 64; i++) {
+		char path[32];
+		struct v4l2_capability vcap;
+
+		snprintf(path, sizeof(path), "/dev/video%d", i);
+		int fd = open(path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+		if (fd < 0)
+			continue;
+
+		memset(&vcap, 0, sizeof(vcap));
+		int r = ioctl(fd, VIDIOC_QUERYCAP, &vcap);
+		close(fd);
+		if (r < 0)
+			continue;
+
+		uint32_t caps = (vcap.capabilities & V4L2_CAP_DEVICE_CAPS) ?
+				vcap.device_caps : vcap.capabilities;
+		if (!(caps & V4L2_CAP_VIDEO_CAPTURE) ||
+		    !(caps & V4L2_CAP_STREAMING) ||
+		    (caps & (V4L2_CAP_VIDEO_M2M | V4L2_CAP_VIDEO_M2M_MPLANE)))
+			continue;
+
+		const char *drv = reinterpret_cast<const char *>(vcap.driver);
+		if (strcmp(drv, "uvcvideo") == 0)
+			return path;
+
+		bool skip = false;
+		for (size_t k = 0; k < ARRAY_SIZE(skip_drivers); k++)
+			if (strcmp(drv, skip_drivers[k]) == 0)
+				skip = true;
+		if (!skip && fallback.empty())
+			fallback = path;
+	}
+
+	return fallback;
+}
+
+int rknn_test::open_source(const rknn_run_options &opt)
+{
+	std::string src = opt.source;
+	bool v4l2 = false;
+
+	if (src.empty()) {
+		src = find_camera();
+		if (src.empty()) {
+			fprintf(stderr,
+				"no usable V4L2 camera found, use --source "
+				"(device, file or GStreamer pipeline)\n");
+			return -1;
+		}
+		printf("using camera %s\n", src.c_str());
+	}
+
+	live_source = true;
+
+	if (src.find('!') != std::string::npos) {
+		/* e.g. "libcamerasrc ! video/x-raw,width=640,height=480,format=BGR ! appsink drop=1" */
+		cap.open(src, cv::CAP_GSTREAMER);
+	} else if (is_number(src)) {
+		cap.open(atoi(src.c_str()), cv::CAP_V4L2);
+		v4l2 = true;
+	} else if (src.rfind("/dev/video", 0) == 0) {
+		cap.open(src, cv::CAP_V4L2);
+		v4l2 = true;
+	} else {
+		cap.open(src, cv::CAP_ANY);
+		/* network streams are live, local files are not */
+		live_source = src.find("://") != std::string::npos;
+	}
+
+	if (!cap.isOpened()) {
+		fprintf(stderr, "cannot open video source [%s]\n", src.c_str());
+		return -1;
+	}
+
+	if (v4l2) {
+		if (opt.mjpg)
+			cap.set(cv::CAP_PROP_FOURCC,
+				cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
+		if (opt.cap_width > 0 && opt.cap_height > 0) {
+			cap.set(cv::CAP_PROP_FRAME_WIDTH, opt.cap_width);
+			cap.set(cv::CAP_PROP_FRAME_HEIGHT, opt.cap_height);
+		}
+		/* keep latency low: never queue old frames in the driver */
+		cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
+	}
+
+	source_fps = cap.get(cv::CAP_PROP_FPS);
+	if (!(source_fps > 0.0 && source_fps <= 240.0))
+		source_fps = 25.0;
+
+	printf("source [%s]: %dx%d @ %.1f fps (%s)\n", src.c_str(),
+	       static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH)),
+	       static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT)),
+	       source_fps, cap.getBackendName().c_str());
+
+	return 0;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Pipeline callbacks                                                       */
+/* ------------------------------------------------------------------------ */
+
+int rknn_test::get_img(void *ctx, cv::Mat &origin, cv::Mat &resize)
+{
+	rknn_test *test_ctx = static_cast<rknn_test *>(ctx);
+
+	if (stop_requested)
+		return RKNN_PIPE_EOF;
+
+	/* read() reuses origin's buffer when the size does not change */
+	if (!test_ctx->cap.read(origin) || origin.empty())
+		return test_ctx->live_source ? -1 : RKNN_PIPE_EOF;
+
+	const cv::Size net_size(test_ctx->img_width, test_ctx->img_height);
+
+	/* resize first, then convert colours on the small image only */
+	if (origin.size() != net_size)
+		cv::resize(origin, resize, net_size, 0, 0, cv::INTER_LINEAR);
+	else
+		origin.copyTo(resize);
+
+	switch (resize.channels()) {
+	case 1:
+		cv::cvtColor(resize, resize, cv::COLOR_GRAY2RGB);
+		break;
+	case 4:
+		cv::cvtColor(resize, resize, cv::COLOR_BGRA2RGB);
+		break;
+	default:
+		cv::cvtColor(resize, resize, cv::COLOR_BGR2RGB);
+		break;
+	}
+
+	return 0;
+}
+
+int rknn_test::detect_img(void *ctx, cv::Mat &img,
+			  struct rknn_out_data *out_data)
+{
+	int ret;
+	rknn_test *test_ctx = static_cast<rknn_test *>(ctx);
+	const size_t expected = static_cast<size_t>(test_ctx->img_width) *
+				test_ctx->img_height * test_ctx->img_channels;
+
+	if (img.empty() || !img.isContinuous() ||
+	    img.total() * img.elemSize() != expected) {
+		fprintf(stderr, "unexpected network input buffer\n");
+		return -1;
+	}
+
+	const unsigned long start_time = get_time();
+
+	ret = test_ctx->rknn_api.set_input(test_ctx->input_index, img.data,
+					   static_cast<uint32_t>(expected));
+	if (ret < 0) {
+		fprintf(stderr, "rknn_inputs_set failed! ret=%d\n", ret);
+		return ret;
+	}
+
+	ret = test_ctx->rknn_api.run(nullptr);
+	if (ret < 0) {
+		fprintf(stderr, "rknn_run failed! ret=%d\n", ret);
+		return ret;
+	}
+
+	/* results land directly in the pipeline buffers (no extra copy) */
+	ret = test_ctx->rknn_api.get_outputs(out_data->out, out_data->size,
+					     out_data->count, nullptr);
+	if (ret < 0) {
+		fprintf(stderr, "rknn_outputs_get failed! ret=%d\n", ret);
+		return ret;
+	}
+
+	test_ctx->detect_count++;
+	test_ctx->detect_time += get_time() - start_time;
+
+	if (test_ctx->detect_count >= STATS_PERIOD) {
+		fprintf(stderr, "[stats] npu round trip = %lu ms\n",
+			test_ctx->detect_time / test_ctx->detect_count);
+		test_ctx->detect_count = 0;
+		test_ctx->detect_time = 0;
+	}
+
+	return 0;
+}
+
+int rknn_test::show_img(void *ctx, cv::Mat &img, float fps,
+			struct rknn_out_data *out_data)
+{
+	int ret;
+	rknn_test *test_ctx = static_cast<rknn_test *>(ctx);
+	const unsigned long start_time = get_time();
+
+	ret = test_ctx->post_process(test_ctx->user_data, img, fps, out_data);
+	if (ret < 0)
+		return ret;
+
+	if (!test_ctx->headless)
+		cv::imshow(test_ctx->win_name, img);
+
+	if (!test_ctx->output_path.empty()) {
+		if (!test_ctx->writer.isOpened()) {
+			test_ctx->writer.open(test_ctx->output_path,
+					      cv::VideoWriter::fourcc('m', 'p', '4', 'v'),
+					      test_ctx->source_fps, img.size());
+			if (!test_ctx->writer.isOpened()) {
+				fprintf(stderr, "cannot write %s, output disabled\n",
+					test_ctx->output_path.c_str());
+				test_ctx->output_path.clear();
+			}
+		}
+		if (test_ctx->writer.isOpened())
+			test_ctx->writer.write(img);
+	}
+
+	test_ctx->show_count++;
+	test_ctx->show_time += get_time() - start_time;
+
+	if (test_ctx->show_count >= STATS_PERIOD) {
+		fprintf(stderr, "[stats] post-process + display = %lu ms, %.2f fps\n",
+			test_ctx->show_time / test_ctx->show_count, fps);
+		test_ctx->show_count = 0;
+		test_ctx->show_time = 0;
+	}
+
+	return 0;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Public API                                                               */
+/* ------------------------------------------------------------------------ */
+
+int rknn_test::load_model(const char *path)
+{
+	int ret;
+	rknn_input_output_num in_out_num;
+
+	is_model_load = false;
+	output_size.clear();
+
+	ret = rknn_api.load_model(path, RKNN_FLAG_PRIOR_MEDIUM);
+	if (ret < 0)
+		return ret;
+
+	ret = rknn_api.get_in_out_num(&in_out_num);
+	if (ret < 0)
+		return ret;
+
+	if (in_out_num.n_output == 0 || in_out_num.n_output > RKNN_MAX_OUTPUTS) {
+		fprintf(stderr, "unsupported number of outputs: %u\n",
+			in_out_num.n_output);
+		return -1;
+	}
+
+	for (uint32_t i = 0; i < in_out_num.n_output; i++) {
+		uint32_t size;
+
+		ret = rknn_api.get_outsize(i, &size);
+		if (ret < 0 || size == 0)
+			return ret < 0 ? ret : -1;
+		output_size.push_back(size);
+	}
+
+	is_model_load = true;
+	return 0;
+}
+
+uint32_t rknn_test::output_elems(uint32_t index) const
+{
+	return index < output_size.size() ?
+	       output_size[index] / static_cast<uint32_t>(sizeof(float)) : 0;
+}
+
+int rknn_test::set_input_info(int width, int height, int channels)
+{
+	if (!is_model_load) {
+		fprintf(stderr, "should load model first!\n");
+		return -1;
+	}
+	if (width <= 0 || height <= 0 || channels <= 0)
+		return -1;
+
+	const rknn_tensor_attr *attr = rknn_api.input_attr(input_index);
+	const uint32_t n = static_cast<uint32_t>(width * height * channels);
+	if (attr && attr->n_elems && attr->n_elems != n) {
+		fprintf(stderr, "model input has %u elements, %dx%dx%d given\n",
+			attr->n_elems, width, height, channels);
+		return -1;
+	}
+
+	img_width = width;
+	img_height = height;
+	img_channels = channels;
+
+	return 0;
+}
+
+int rknn_test::common_run(rknn_post_process_fn func, void *data)
+{
+	int ret;
+
+	if (!is_model_load) {
+		fprintf(stderr, "should load model first!\n");
+		return -1;
+	}
+	if (!img_width || !img_height || !img_channels) {
+		fprintf(stderr, "should set input info first!\n");
+		return -1;
+	}
+	if (!func)
+		return -1;
+
+	post_process = func;
+	user_data = data;
+
+	if (!headless) {
+		if (!getenv("DISPLAY") && !getenv("WAYLAND_DISPLAY")) {
+			fprintf(stderr,
+				"no graphical session (DISPLAY/WAYLAND_DISPLAY "
+				"unset): use --headless\n");
+			return -1;
+		}
+		cv::namedWindow(win_name, cv::WINDOW_AUTOSIZE);
+	}
+
+	rknn_opencv pipeline(4);
+
+	ret = pipeline.start(get_img, detect_img, show_img, this, output_size,
+			     live_source);
+	if (ret < 0) {
+		fprintf(stderr, "cannot start pipeline\n");
+		return ret;
+	}
+
+	if (headless)
+		printf(">>> running, Ctrl-C (SIGINT) or SIGTERM to stop <<<\n");
+	else
+		printf(">>> press ESC or q in the window to exit <<<\n");
+
+	bool shown_any = false;
+	int show_ret = 0;
+
+	while (!stop_requested) {
+		ret = pipeline.update_show();
+		if (ret < 0) {
+			if (ret < -1)
+				show_ret = ret;
+			break;
+		}
+		if (ret > 0)
+			shown_any = true;
+
+		if (!headless) {
+			const int key = cv::waitKey(1) & 0xff;
+			if (key == 27 || key == 'q' || key == 'Q')
+				break;
+			/* window closed with the title bar button */
+			if (shown_any &&
+			    cv::getWindowProperty(win_name,
+						  cv::WND_PROP_VISIBLE) < 1)
+				break;
+		}
+	}
+
+	pipeline.stop();
+
+	if (pipeline.dropped())
+		printf("%llu stale frame(s) dropped to keep latency low\n",
+		       static_cast<unsigned long long>(pipeline.dropped()));
+
+	if (!headless)
+		cv::destroyAllWindows();
+	if (writer.isOpened())
+		writer.release();
+
+	if (show_ret < 0)
+		return show_ret;
+	return pipeline.error();
+}
+
+int rknn_test::run(const rknn_run_options &opt, rknn_post_process_fn func,
+		   void *data)
+{
+	int ret;
+
+	headless = opt.headless;
+	output_path = opt.output;
+
+	ret = open_source(opt);
+	if (ret < 0)
+		return ret;
+
+	ret = common_run(func, data);
+
+	cap.release();
+
+	return ret;
+}
+
+int rknn_test::run(int video_node, rknn_post_process_fn func, void *data)
+{
+	rknn_run_options opt;
+
+	opt.source = std::to_string(video_node);
+	return run(opt, func, data);
+}
+
+int rknn_test::run(const char *video_name, rknn_post_process_fn func,
+		   void *data)
+{
+	rknn_run_options opt;
+
+	opt.source = video_name ? video_name : "";
+	return run(opt, func, data);
+}
+```
+
+### `install_rknn/install_rknn_api.sh`
+```bash
+#!/usr/bin/env bash
+#
+# Fetch the RKNN *host* SDK needed to drive an RK1808 USB compute stick
+# (passive mode) from an aarch64 Linux host (Raspberry Pi 5, Orange Pi 6
+# Plus, ...):
+#
+#   include/rockchip/rknn_api.h   RKNN v1 C API header
+#   lib/librknn_api.so            host client library 1.7.5 (LION_PUMA)
+#   bin/npu_transfer_proxy        USB transport daemon for the stick
+#
+# The historical source (repo.rock-chips.com) is offline. Files now come from
+# Rockchip's GitHub repositories, pinned to a commit and checked by SHA-256.
+#
+# Note: rknpu's own lib64/librknn_api.so is the *on-device* runtime loader
+# (it dlopen()s librknn_runtime.so) and cannot drive a stick: the host client
+# ships only inside the rknn-toolkit-lite wheel.
+#
+# Usage:
+#   install_rknn_api.sh [--prefix DIR]   stage the SDK (default: ./third_party/rknn)
+#   sudo install_rknn_api.sh --system    install into /usr/local + udev + systemd
+#                                        (manual install; prefer the .deb)
+#   --wheel FILE / --header FILE         use local copies (offline build)
+#   --force                              allow a non-aarch64 host (staging only)
+
+set -euo pipefail
+
+readonly RKNPU_COMMIT="e0cb42b645707ca12518c43dcee7c4968cbe918f"
+readonly TOOLKIT_COMMIT="8e30ee72e772d6d39f2fcaf4047fead450b3ee89"
+
+readonly HEADER_URL="https://raw.githubusercontent.com/rockchip-linux/rknpu/${RKNPU_COMMIT}/rknn/rknn_api/librknn_api/include/rknn_api.h"
+readonly WHEEL_NAME="rknn_toolkit_lite-1.7.5-cp310-cp310-linux_aarch64.whl"
+readonly WHEEL_URL="https://raw.githubusercontent.com/rockchip-linux/rknn-toolkit/${TOOLKIT_COMMIT}/rknn-toolkit-lite/packages/${WHEEL_NAME}"
+
+readonly HEADER_SHA256="704ff9bd6cc05f3767d4eaa16341632df3bb7789dd05abe317c90d2c00eebc72"
+readonly WHEEL_SHA256="d1c3f119f7cae1ce9eed07c6d753c6554afec47b128afb2d0582a3d462a9b14c"
+readonly LIB_SHA256="2b22f0e425958f66b36bf65b4602eddca081d27e3e8a195b08dfbd1af4d4038e"
+readonly PROXY_SHA256="c4e77bdfe9256cf0671094db8d98fbcdba65a71cafa04040742c1bfff4052900"
+
+readonly LIB_MEMBER="rknnlite/api/lib/hardware/LION_PUMA/linux-aarch64/librknn_api.so"
+readonly PROXY_MEMBER="rknnlite/3rdparty/platform-tools/ntp/linux-aarch64/npu_transfer_proxy"
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+
+PREFIX="${REPO_DIR}/third_party/rknn"
+SYSTEM=0
+FORCE=0
+LOCAL_WHEEL=""
+LOCAL_HEADER=""
+
+die() { echo "error: $*" >&2; exit 1; }
+log() { echo "==> $*"; }
+
+usage() {
+	sed -n '3,/^$/s/^# \{0,1\}//p' "${BASH_SOURCE[0]}"
+	exit "${1:-0}"
+}
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	--prefix)  [[ $# -ge 2 ]] || die "--prefix needs a value"; PREFIX="$2"; shift 2 ;;
+	--system)  SYSTEM=1; PREFIX="/usr/local"; shift ;;
+	--wheel)   [[ $# -ge 2 ]] || die "--wheel needs a value"; LOCAL_WHEEL="$2"; shift 2 ;;
+	--header)  [[ $# -ge 2 ]] || die "--header needs a value"; LOCAL_HEADER="$2"; shift 2 ;;
+	--force)   FORCE=1; shift ;;
+	-h|--help) usage 0 ;;
+	*)         echo "unknown option: $1" >&2; usage 1 ;;
+	esac
+done
+
+ARCH="$(uname -m)"
+if [[ "${ARCH}" != "aarch64" && "${FORCE}" -eq 0 ]]; then
+	die "host is ${ARCH}: the Rockchip binaries are aarch64 only (use --force to stage anyway)"
+fi
+
+if [[ "${SYSTEM}" -eq 1 && "${EUID}" -ne 0 ]]; then
+	die "--system requires root (sudo)"
+fi
+
+for tool in curl sha256sum python3 install; do
+	command -v "${tool}" >/dev/null 2>&1 || die "missing tool: ${tool} (apt install curl coreutils python3)"
+done
+
+check_sha256() {
+	local file="$1" expected="$2" actual
+	actual="$(sha256sum "${file}" | cut -d' ' -f1)"
+	[[ "${actual}" == "${expected}" ]] ||
+		die "checksum mismatch for ${file}: got ${actual}, expected ${expected}"
+}
+
+fetch() {
+	local url="$1" out="$2"
+	curl --fail --silent --show-error --location --retry 3 \
+	     --proto '=https' --tlsv1.2 -o "${out}" "${url}"
+}
+
+WORK="$(mktemp -d)"
+trap 'rm -rf -- "${WORK}"' EXIT
+
+# --- header ------------------------------------------------------------------
+if [[ -n "${LOCAL_HEADER}" ]]; then
+	cp -- "${LOCAL_HEADER}" "${WORK}/rknn_api.h"
+else
+	log "downloading rknn_api.h (rknpu@${RKNPU_COMMIT:0:7})"
+	fetch "${HEADER_URL}" "${WORK}/rknn_api.h"
+fi
+check_sha256 "${WORK}/rknn_api.h" "${HEADER_SHA256}"
+
+# --- wheel -> librknn_api.so + npu_transfer_proxy ----------------------------
+if [[ -n "${LOCAL_WHEEL}" ]]; then
+	cp -- "${LOCAL_WHEEL}" "${WORK}/${WHEEL_NAME}"
+else
+	log "downloading ${WHEEL_NAME} (rknn-toolkit@${TOOLKIT_COMMIT:0:7})"
+	fetch "${WHEEL_URL}" "${WORK}/${WHEEL_NAME}"
+fi
+check_sha256 "${WORK}/${WHEEL_NAME}" "${WHEEL_SHA256}"
+
+log "extracting host library and proxy"
+python3 -I - "${WORK}/${WHEEL_NAME}" "${WORK}" "${LIB_MEMBER}" "${PROXY_MEMBER}" <<'PY'
+import os, sys, zipfile
+whl, out, *members = sys.argv[1:]
+with zipfile.ZipFile(whl) as z:
+    for m in members:
+        dest = os.path.join(out, os.path.basename(m))
+        with z.open(m) as src, open(dest, "wb") as dst:
+            dst.write(src.read())
+PY
+check_sha256 "${WORK}/librknn_api.so" "${LIB_SHA256}"
+check_sha256 "${WORK}/npu_transfer_proxy" "${PROXY_SHA256}"
+
+# --- install -----------------------------------------------------------------
+log "installing into ${PREFIX}"
+install -d -m 0755 "${PREFIX}/include/rockchip" "${PREFIX}/lib" "${PREFIX}/bin"
+install -m 0644 "${WORK}/rknn_api.h" "${PREFIX}/include/rockchip/rknn_api.h"
+install -m 0644 "${WORK}/librknn_api.so" "${PREFIX}/lib/librknn_api.so"
+install -m 0755 "${WORK}/npu_transfer_proxy" "${PREFIX}/bin/npu_transfer_proxy"
+
+if [[ "${SYSTEM}" -eq 1 ]]; then
+	log "installing udev rule and systemd unit"
+	install -D -m 0644 "${REPO_DIR}/packaging/udev/60-rk1808-npu.rules" \
+		/etc/udev/rules.d/60-rk1808-npu.rules
+	# the unit references the .deb path: point it to /usr/local instead
+	install -d -m 0755 /etc/systemd/system
+	sed 's#/usr/lib/slave-mobilenet-ssd/npu_transfer_proxy#/usr/local/bin/npu_transfer_proxy#' \
+		"${REPO_DIR}/packaging/systemd/npu-transfer-proxy.service" \
+		> /etc/systemd/system/npu-transfer-proxy.service
+	chmod 0644 /etc/systemd/system/npu-transfer-proxy.service
+
+	ldconfig
+	udevadm control --reload-rules
+	udevadm trigger --action=change --subsystem-match=usb --attr-match=idVendor=2207 || true
+	systemctl daemon-reload
+	systemctl enable --now npu-transfer-proxy.service
+	log "done: systemctl status npu-transfer-proxy"
+else
+	log "done. Build with: cmake -S . -B build -DRKNN_SDK_DIR=${PREFIX} && cmake --build build"
+fi
+```
+
+### `packaging/build-deb.sh` (nouveau, script du paquet)
+```bash
+#!/usr/bin/env bash
+#
+# Build the slave-mobilenet-ssd .deb natively on an arm64 Ubuntu host
+# (Raspberry Pi 5 or Orange Pi 6 Plus). The same package installs on both.
+#
+# Usage: packaging/build-deb.sh [options]
+#   --revision N       Debian revision (default 1)
+#   --version X.Y.Z    upstream version (default: project() VERSION in CMakeLists.txt)
+#   --sdk-dir DIR      RKNN host SDK already staged (default: third_party/rknn,
+#                      fetched with install_rknn/install_rknn_api.sh if missing)
+#   --output-dir DIR   where to write the .deb (default: ./dist)
+#   --native           tune for this exact CPU (-mcpu=native); default targets
+#                      armv8.2-a so the package runs on both boards
+#   --jobs N           parallel build jobs (default: nproc)
+#   --allow-any-arch   do not refuse a non-arm64 host (packaging tests only)
+#
+# Build dependencies:
+#   sudo apt install build-essential cmake libopencv-dev dpkg-dev curl python3 file
+# Optional: lintian
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+
+readonly PKG="slave-mobilenet-ssd"
+readonly PRIVATE_DIR="usr/lib/${PKG}"
+
+REVISION="1"
+VERSION=""
+SDK_DIR="${REPO_DIR}/third_party/rknn"
+OUT_DIR="${REPO_DIR}/dist"
+NATIVE="OFF"
+JOBS="$(nproc 2>/dev/null || echo 2)"
+ANY_ARCH=0
+
+die() { echo "error: $*" >&2; exit 1; }
+log() { echo "==> $*"; }
+
+usage() {
+	sed -n '3,/^$/s/^# \{0,1\}//p' "${BASH_SOURCE[0]}"
+	exit "${1:-0}"
+}
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	--revision)       [[ $# -ge 2 ]] || die "$1 needs a value"; REVISION="$2"; shift 2 ;;
+	--version)        [[ $# -ge 2 ]] || die "$1 needs a value"; VERSION="$2"; shift 2 ;;
+	--sdk-dir)        [[ $# -ge 2 ]] || die "$1 needs a value"; SDK_DIR="$(realpath -m -- "$2")"; shift 2 ;;
+	--output-dir)     [[ $# -ge 2 ]] || die "$1 needs a value"; OUT_DIR="$(realpath -m -- "$2")"; shift 2 ;;
+	--native)         NATIVE="ON"; shift ;;
+	--jobs)           [[ $# -ge 2 ]] || die "$1 needs a value"; JOBS="$2"; shift 2 ;;
+	--allow-any-arch) ANY_ARCH=1; shift ;;
+	-h|--help)        usage 0 ;;
+	*)                echo "unknown option: $1" >&2; usage 1 ;;
+	esac
+done
+
+[[ "${REVISION}" =~ ^[0-9A-Za-z.+~]+$ ]] || die "invalid revision: ${REVISION}"
+[[ "${JOBS}" =~ ^[0-9]+$ ]] || die "invalid --jobs: ${JOBS}"
+
+# --- sanity checks -------------------------------------------------------------
+for tool in cmake c++ dpkg-deb dpkg-shlibdeps dpkg-architecture du find sed gzip; do
+	command -v "${tool}" >/dev/null 2>&1 ||
+		die "missing ${tool}: sudo apt install build-essential cmake libopencv-dev dpkg-dev curl python3 file"
+done
+dpkg-query -W -f='${Status}' libopencv-dev 2>/dev/null | grep -q "install ok installed" ||
+	die "libopencv-dev is not installed: sudo apt install libopencv-dev"
+
+DEB_ARCH="$(dpkg --print-architecture)"
+if [[ "${DEB_ARCH}" != "arm64" && "${ANY_ARCH}" -eq 0 ]]; then
+	die "build host is ${DEB_ARCH}; build natively on the arm64 board (librknn_api.so is aarch64-only)"
+fi
+
+if [[ -z "${VERSION}" ]]; then
+	VERSION="$(sed -n '/^project(/,/)/s/^[[:space:]]*VERSION[[:space:]]\+\([0-9.]\+\).*/\1/p' \
+		"${REPO_DIR}/CMakeLists.txt" | head -n1)"
+	[[ -n "${VERSION}" ]] || die "cannot read VERSION from CMakeLists.txt"
+fi
+[[ "${VERSION}" =~ ^[0-9][0-9A-Za-z.+~]*$ ]] || die "invalid version: ${VERSION}"
+FULL_VERSION="${VERSION}-${REVISION}"
+
+# Reproducible timestamps: last commit date when available.
+if [[ -z "${SOURCE_DATE_EPOCH:-}" ]]; then
+	SOURCE_DATE_EPOCH="$(git -C "${REPO_DIR}" log -1 --format=%ct 2>/dev/null || date +%s)"
+fi
+export SOURCE_DATE_EPOCH
+
+MAINT_NAME="${DEBFULLNAME:-$(git -C "${REPO_DIR}" config user.name 2>/dev/null || true)}"
+MAINT_MAIL="${DEBEMAIL:-$(git -C "${REPO_DIR}" config user.email 2>/dev/null || true)}"
+MAINT_NAME="${MAINT_NAME:-$(id -un)}"
+MAINT_MAIL="${MAINT_MAIL:-$(id -un)@$(hostname -f 2>/dev/null || hostname)}"
+MAINTAINER="${MAINT_NAME} <${MAINT_MAIL}>"
+
+# --- RKNN host SDK -------------------------------------------------------------
+if [[ ! -f "${SDK_DIR}/include/rockchip/rknn_api.h" ||
+      ! -f "${SDK_DIR}/lib/librknn_api.so" ||
+      ! -x "${SDK_DIR}/bin/npu_transfer_proxy" ]]; then
+	log "RKNN host SDK not found in ${SDK_DIR}, fetching it"
+	force=()
+	[[ "${ANY_ARCH}" -eq 1 ]] && force=(--force)
+	"${REPO_DIR}/install_rknn/install_rknn_api.sh" --prefix "${SDK_DIR}" "${force[@]}"
+fi
+
+# --- build ---------------------------------------------------------------------
+WORK="$(mktemp -d)"
+trap 'rm -rf -- "${WORK}"' EXIT
+BUILD_DIR="${WORK}/build"
+STAGE="${WORK}/stage"
+
+log "configuring (${PKG} ${FULL_VERSION}, ${DEB_ARCH})"
+cmake -S "${REPO_DIR}" -B "${BUILD_DIR}" \
+	-DCMAKE_BUILD_TYPE=Release \
+	-DCMAKE_INSTALL_PREFIX=/usr \
+	-DSSD_BUNDLE_RKNN=ON \
+	-DSSD_NATIVE_TUNING="${NATIVE}" \
+	-DRKNN_SDK_DIR="${SDK_DIR}" >/dev/null
+
+log "building"
+cmake --build "${BUILD_DIR}" --parallel "${JOBS}"
+
+log "staging"
+DESTDIR="${STAGE}" cmake --install "${BUILD_DIR}" --strip >/dev/null
+
+# --- documentation -------------------------------------------------------------
+DOC_DIR="${STAGE}/usr/share/doc/${PKG}"
+install -d -m 0755 "${DOC_DIR}"
+install -m 0644 "${REPO_DIR}/README.md" "${DOC_DIR}/README.md"
+
+cat > "${DOC_DIR}/copyright" <<EOF
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: slave_mobilenet_ssd
+Source: https://github.com/Trak-unixbased/slave_mobilenet_ssd
+
+Files: *
+Copyright: Rockchip Electronics Co., Ltd. and contributors
+License: unspecified
+ The upstream repository does not state a license for the demo sources.
+
+Files: usr/lib/${PKG}/librknn_api.so usr/lib/${PKG}/npu_transfer_proxy
+ usr/share/${PKG}/models/ssd/mobilenet_ssd.rknn
+Copyright: Rockchip Electronics Co., Ltd.
+License: proprietary
+ Binary-only components distributed by Rockchip in rknn-toolkit
+ (https://github.com/rockchip-linux/rknn-toolkit). Redistribution is subject
+ to Rockchip's terms; keep this package for internal use.
+EOF
+chmod 0644 "${DOC_DIR}/copyright"
+
+CHANGE_DATE="$(date -u -R -d "@${SOURCE_DATE_EPOCH}")"
+cat > "${WORK}/changelog.Debian" <<EOF
+${PKG} (${FULL_VERSION}) unstable; urgency=medium
+
+  * Native package for Ubuntu 26.04 arm64 (Raspberry Pi 5, Orange Pi 6 Plus)
+    driving an RK1808 USB compute stick in passive mode.
+
+ -- ${MAINTAINER}  ${CHANGE_DATE}
+EOF
+gzip -9n -c "${WORK}/changelog.Debian" > "${DOC_DIR}/changelog.Debian.gz"
+chmod 0644 "${DOC_DIR}/changelog.Debian.gz"
+
+# --- dependencies (dpkg-shlibdeps needs a debian/control in its cwd) -----------
+log "computing shared library dependencies"
+SHLIBS_DIR="${WORK}/shlibs"
+install -d "${SHLIBS_DIR}/debian"
+printf 'Source: %s\n\nPackage: %s\nArchitecture: any\n' "${PKG}" "${PKG}" \
+	> "${SHLIBS_DIR}/debian/control"
+
+SHLIBS_DEPENDS="$(
+	cd "${SHLIBS_DIR}" &&
+	dpkg-shlibdeps -O --ignore-missing-info --warnings=0 \
+		-l"${STAGE}/${PRIVATE_DIR}" \
+		-e"${STAGE}/usr/bin/ssd_demo" \
+		-e"${STAGE}/${PRIVATE_DIR}/librknn_api.so" \
+		-e"${STAGE}/${PRIVATE_DIR}/npu_transfer_proxy" 2>/dev/null |
+	sed -n 's/^shlibs:Depends=//p'
+)"
+[[ -n "${SHLIBS_DEPENDS}" ]] || die "dpkg-shlibdeps returned no dependency"
+
+INSTALLED_SIZE="$(du -sk --apparent-size "${STAGE}" | cut -f1)"
+
+# --- DEBIAN/ ---------------------------------------------------------------------
+install -d -m 0755 "${STAGE}/DEBIAN"
+cat > "${STAGE}/DEBIAN/control" <<EOF
+Package: ${PKG}
+Version: ${FULL_VERSION}
+Architecture: ${DEB_ARCH}
+Maintainer: ${MAINTAINER}
+Installed-Size: ${INSTALLED_SIZE}
+Depends: ${SHLIBS_DEPENDS}
+Recommends: v4l-utils, gstreamer1.0-plugins-good
+Suggests: gstreamer1.0-libcamera
+Section: video
+Priority: optional
+Homepage: https://github.com/Trak-unixbased/slave_mobilenet_ssd
+Description: MobileNet-SSD object detection on an RK1808 USB compute stick
+ Real-time object detection (COCO, 90 classes) where the network runs on a
+ Rockchip RK1808 AI compute stick in passive mode, driven over USB from an
+ arm64 host such as a Raspberry Pi 5 or an Orange Pi 6 Plus.
+ .
+ Ships the ssd_demo program, the MobileNet-SSD model, the Rockchip host
+ library (librknn_api 1.7.5, private copy), npu_transfer_proxy as a hardened
+ systemd service and the udev rule granting access to the stick.
+EOF
+
+for script in postinst prerm postrm; do
+	install -m 0755 "${SCRIPT_DIR}/debian/${script}" "${STAGE}/DEBIAN/${script}"
+done
+
+# normalise permissions and timestamps, then checksums
+find "${STAGE}" -type d -exec chmod 0755 {} +
+find "${STAGE}" -path "${STAGE}/DEBIAN" -prune -o -type f -print0 |
+	xargs -0 touch -h -d "@${SOURCE_DATE_EPOCH}"
+(
+	cd "${STAGE}" &&
+	find . -path ./DEBIAN -prune -o -type f -print0 | sort -z |
+	xargs -0 md5sum | sed 's#  \./#  #'
+) > "${STAGE}/DEBIAN/md5sums"
+chmod 0644 "${STAGE}/DEBIAN/control" "${STAGE}/DEBIAN/md5sums"
+
+# --- build the .deb --------------------------------------------------------------
+install -d -m 0755 "${OUT_DIR}"
+DEB="${OUT_DIR}/${PKG}_${FULL_VERSION}_${DEB_ARCH}.deb"
+log "building ${DEB}"
+dpkg-deb --root-owner-group -Zxz --build "${STAGE}" "${DEB}" >/dev/null
+
+if command -v lintian >/dev/null 2>&1; then
+	log "lintian (informative)"
+	lintian --no-tag-display-limit \
+		--suppress-tags embedded-library,shared-library-lacks-version,no-manual-page,initial-upload-closes-no-bugs,debian-changelog-file-missing-or-wrong-name \
+		"${DEB}" || true
+fi
+
+log "package contents"
+dpkg-deb --info "${DEB}" | sed -n '/Package:/,$p'
+dpkg-deb --contents "${DEB}" | awk '{print $6}'
+
+cat <<EOF
+
+Done: ${DEB}
+Install:  sudo apt install ${DEB}
+Check:    systemctl status npu-transfer-proxy
+          lsusb -d 2207:
+Run:      ssd_demo                    # desktop session, first USB camera
+          ssd_demo --headless -s /dev/video8
+EOF
+```
+
+### `packaging/systemd/npu-transfer-proxy.service` (nouveau, remplace `npud`)
+```ini
+[Unit]
+Description=Rockchip NPU transfer proxy (RK1808 USB compute stick, passive mode)
+Documentation=https://github.com/Trak-unixbased/slave_mobilenet_ssd
+# Also pulled in by udev (60-rk1808-npu.rules) when a stick is plugged.
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/slave-mobilenet-ssd/npu_transfer_proxy
+Restart=on-failure
+RestartSec=2s
+
+# Clients (librknn_api) connect through the abstract unix socket
+# "@transfer_proxy" of the host network namespace: no PrivateNetwork.
+
+# Unprivileged: USB access comes from the udev rule (group plugdev).
+DynamicUser=yes
+SupplementaryGroups=plugdev
+StateDirectory=npu-transfer-proxy
+WorkingDirectory=/var/lib/npu-transfer-proxy
+
+# Only USB character devices are reachable.
+DevicePolicy=closed
+DeviceAllow=char-usb_device rw
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### `packaging/udev/60-rk1808-npu.rules` (nouveau)
+```
+# Rockchip RK1808 AI compute stick (USB vendor 0x2207).
+#  - group plugdev (used by npu-transfer-proxy.service) instead of world 0666
+#  - uaccess: the logged-in desktop user also gets access
+#  - plugging the stick starts npu-transfer-proxy.service if it is stopped
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="2207", \
+  MODE="0660", GROUP="plugdev", TAG+="uaccess", \
+  TAG+="systemd", ENV{SYSTEMD_WANTS}+="npu-transfer-proxy.service"
+```
+
+### `packaging/debian/postinst`
+```sh
+#!/bin/sh
+set -e
+
+UNIT=npu-transfer-proxy.service
+
+case "$1" in
+configure)
+	if [ -d /run/udev ] && command -v udevadm >/dev/null 2>&1; then
+		udevadm control --reload-rules || true
+		# re-apply permissions to a stick that is already plugged in
+		udevadm trigger --action=change --subsystem-match=usb \
+			--attr-match=idVendor=2207 || true
+	fi
+	;;
+abort-upgrade|abort-remove|abort-deconfigure)
+	;;
+*)
+	echo "postinst called with unknown argument '$1'" >&2
+	exit 1
+	;;
+esac
+
+# Same logic as dh_installsystemd: enable on first install, keep the admin's
+# choice on upgrade, (re)start the proxy.
+if [ "$1" = "configure" ] || [ "$1" = "abort-upgrade" ] || \
+   [ "$1" = "abort-deconfigure" ] || [ "$1" = "abort-remove" ]; then
+	if command -v deb-systemd-helper >/dev/null 2>&1; then
+		deb-systemd-helper unmask "$UNIT" >/dev/null || true
+		if deb-systemd-helper --quiet was-enabled "$UNIT"; then
+			deb-systemd-helper enable "$UNIT" >/dev/null || true
+		else
+			deb-systemd-helper update-state "$UNIT" >/dev/null || true
+		fi
+	fi
+
+	if [ -d /run/systemd/system ]; then
+		systemctl --system daemon-reload >/dev/null || true
+		if [ -n "$2" ]; then
+			_action=restart
+		else
+			_action=start
+		fi
+		deb-systemd-invoke "$_action" "$UNIT" >/dev/null || true
+	fi
+fi
+
+exit 0
+```
+
+### `packaging/debian/prerm`
+```sh
+#!/bin/sh
+set -e
+
+UNIT=npu-transfer-proxy.service
+
+if [ -d /run/systemd/system ] && [ "$1" = "remove" ]; then
+	deb-systemd-invoke stop "$UNIT" >/dev/null || true
+fi
+
+exit 0
+```
+
+### `packaging/debian/postrm`
+```sh
+#!/bin/sh
+set -e
+
+UNIT=npu-transfer-proxy.service
+
+if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+	if [ -d /run/systemd/system ]; then
+		systemctl --system daemon-reload >/dev/null || true
+	fi
+	if [ -d /run/udev ] && command -v udevadm >/dev/null 2>&1; then
+		udevadm control --reload-rules || true
+	fi
+fi
+
+if [ "$1" = "remove" ] && command -v deb-systemd-helper >/dev/null 2>&1; then
+	deb-systemd-helper mask "$UNIT" >/dev/null || true
+fi
+
+if [ "$1" = "purge" ] && command -v deb-systemd-helper >/dev/null 2>&1; then
+	deb-systemd-helper purge "$UNIT" >/dev/null || true
+	deb-systemd-helper unmask "$UNIT" >/dev/null || true
+	rm -rf /var/lib/private/npu-transfer-proxy /var/lib/npu-transfer-proxy
+fi
+
+exit 0
+```
+
+### `.gitignore` (nouveau)
+```
+# build trees
+/build/
+/build-*/
+/dist/
+*.deb
+
+# RKNN host SDK fetched by install_rknn/install_rknn_api.sh (proprietary)
+/third_party/
+```
+
+### `README.md`
+````markdown
+# slave_mobilenet_ssd
+
+Détection d'objets MobileNet-SSD (COCO, 90 classes, entrée 300×300) dont le
+réseau s'exécute sur une **clé de calcul USB Rockchip RK1808** en mode passif
+(« slave »). La carte hôte ne fait que la capture, le pré/post-traitement et
+l'affichage.
+
+| Hôte cible                | SoC            | OS                         |
+|---------------------------|----------------|----------------------------|
+| Raspberry Pi 5 (8 Go)     | BCM2712        | Ubuntu 26.04 LTS arm64     |
+| Orange Pi 6 Plus          | CIX CD8180     | Ubuntu 26.04 LTS arm64     |
+
+> Ni la Pi 5 ni la CD8180 n'ont de NPU Rockchip : **la clé RK1808 est
+> obligatoire**. Le NPU intégré de la CD8180 utilise un autre SDK (CIX NOE)
+> et un autre format de modèle ; il n'est pas utilisé ici.
+
+## Architecture
+
+```
+caméra/fichier ─► thread capture ─► file d'entrée ─► thread NPU ─► file de sortie ─► thread principal
+                  (resize + RGB)    (frames périmées   (librknn_api ──USB──► RK1808)   (post-traitement SSD,
+                                     recyclées en live)                                  affichage / stdout / mp4)
+```
+
+`librknn_api.so` (client hôte 1.7.5) dialogue avec `npu_transfer_proxy`
+(socket unix abstraite `@transfer_proxy`), qui pilote la clé via libusb.
+Le proxy tourne comme service systemd non privilégié.
+
+## Paquet .deb (recommandé)
+
+À construire **sur la carte** (arm64) ; le même paquet s'installe sur les deux.
+
+```bash
+sudo apt install build-essential cmake libopencv-dev dpkg-dev curl python3 file
+./packaging/build-deb.sh            # télécharge le SDK hôte épinglé, compile, empaquette
+sudo apt install ./dist/slave-mobilenet-ssd_1.1.0-1_arm64.deb
+```
+
+Le script récupère `rknn_api.h` (dépôt `rockchip-linux/rknpu`) ainsi que
+`librknn_api.so` et `npu_transfer_proxy` (wheel `rknn-toolkit-lite` 1.7.5 du
+dépôt `rockchip-linux/rknn-toolkit`), à des commits figés, avec contrôle
+SHA-256. L'ancien serveur `repo.rock-chips.com` n'existe plus.
+
+Contenu installé :
+
+| Chemin | Rôle |
+|---|---|
+| `/usr/bin/ssd_demo` | programme (RUNPATH vers la lib privée) |
+| `/usr/lib/slave-mobilenet-ssd/` | `librknn_api.so`, `npu_transfer_proxy` |
+| `/usr/share/slave-mobilenet-ssd/models/ssd/` | modèle, priors, labels |
+| `/usr/lib/systemd/system/npu-transfer-proxy.service` | proxy, `DynamicUser`, durci |
+| `/usr/lib/udev/rules.d/60-rk1808-npu.rules` | accès USB `plugdev` 0660 + `uaccess`, démarre le proxy au branchement |
+
+Options utiles : `--native` (`-mcpu=native`, paquet propre à une carte),
+`--revision N`, `--sdk-dir DIR` (build hors ligne).
+
+## Vérifications
+
+```bash
+lsusb -d 2207:                         # la clé est vue
+systemctl status npu-transfer-proxy    # le proxy tourne
+journalctl -u npu-transfer-proxy -b
+```
+
+Sur Raspberry Pi 5, utiliser l'alimentation 5 V / 5 A : avec une alimentation
+plus faible, le firmware limite le courant total des ports USB à 600 mA.
+
+## Utilisation
+
+```bash
+ssd_demo                                   # session graphique, 1re caméra USB (UVC)
+ssd_demo -s /dev/video8 -W 1280 -H 720     # caméra précise
+ssd_demo --headless -s /dev/video8         # SSH / service : détections sur stdout
+ssd_demo --headless -s video.mp4 -o out.mp4
+ssd_demo -s "libcamerasrc ! video/x-raw,width=640,height=480,format=BGRx ! videoconvert ! video/x-raw,format=BGR ! appsink drop=1 max-buffers=1"
+```
+
+La dernière ligne (caméra CSI de la Pi 5) suppose `gstreamer1.0-libcamera` et
+une pile libcamera qui reconnaît le capteur (`cam -l`).
+
+Sans `--source`, le programme choisit le premier périphérique `uvcvideo` :
+sur Pi 5, `/dev/video0..7` appartiennent au RP1-CFE/PiSP et ne sont pas des
+webcams.
+
+| Option | Défaut | Rôle |
+|---|---|---|
+| `-s, --source` | 1re webcam USB | index, `/dev/videoN`, fichier, URL ou pipeline GStreamer |
+| `-W/-H` | 640×480 | résolution de capture V4L2 |
+| `--no-mjpg` | MJPG demandé | désactive MJPG (bande passante USB) |
+| `-t, --threshold` | 0.40 | score minimal |
+| `-n, --nms` | 0.45 | seuil IoU du NMS |
+| `-k, --max-det` | 50 | détections max par image |
+| `--headless` | non | pas de fenêtre, détections sur stdout |
+| `-o, --output` | — | vidéo annotée (mp4) |
+| `-m/-l/-p` | données installées | modèle / labels / priors |
+| `-q` | non | n'affiche pas les détections |
+
+Quitter : `Échap` ou `q` dans la fenêtre, fermeture de la fenêtre, `Ctrl-C`
+ou `SIGTERM`. Les fichiers de données sont cherchés dans `$SSD_DATA_DIR`, à
+côté du binaire (`../models/ssd`), puis dans `/usr/share/slave-mobilenet-ssd`.
+
+## Compilation de développement (sans paquet)
+
+```bash
+./install_rknn/install_rknn_api.sh            # → third_party/rknn
+cmake -S . -B build && cmake --build build -j
+sudo ./install_rknn/install_rknn_api.sh --system   # proxy + udev dans /usr/local (si pas de .deb)
+./build/ssd_demo
+```
+
+## Dépannage
+
+| Symptôme | Cause probable |
+|---|---|
+| `rknn_init failed: -3 (device unavailable)` | clé absente, proxy arrêté, alimentation USB insuffisante |
+| `rknn_init failed: -10` / `-11` | firmware de la clé trop ancien pour le SDK 1.7.5 : mettre à jour la clé |
+| proxy en échec, erreur d'accès USB dans le journal | règle udev non appliquée : rebrancher la clé ou `sudo udevadm trigger` |
+| `no graphical session` | pas de `DISPLAY`/`WAYLAND_DISPLAY` : utiliser `--headless` |
+| `no usable V4L2 camera` | `v4l2-ctl --list-devices`, puis `-s /dev/videoN` |
+
+Si le proxy refuse de fonctionner sans privilèges sur votre version de
+firmware, surcharger le service :
+`sudo systemctl edit npu-transfer-proxy` avec `[Service]` / `DynamicUser=no`.
+
+## Licences
+
+Les sources du dépôt amont ne précisent pas de licence. `librknn_api.so`,
+`npu_transfer_proxy` et `rknn_api.h` sont des composants propriétaires
+Rockchip : ils ne sont pas versionnés ici, le script de build les télécharge.
+Le modèle `.rknn` (Rockchip lui aussi) était déjà versionné en amont.
+Réserver le paquet à un usage interne.
+
+Guides d'origine Rockchip (hors ligne) :
+http://t.rock-chips.com/en/wiki.php?mod=view&id=58
+````
+
+### Supprimé
+- `install_rknn/script/npud` → `git rm`, remplacé par `packaging/systemd/npu-transfer-proxy.service`.
+
+Fichiers joints :
+- `slave_mobilenet_ssd-ubuntu2604-arm64.patch` : à appliquer avec `git apply` sur `c8efd43`. Il crée les fichiers, applique les droits d'exécution et supprime `npud`.
+- `slave_mobilenet_ssd-corrige.tar.gz` : l'arbre complet, sans `.git` ni SDK propriétaire.
